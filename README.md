@@ -4,7 +4,7 @@
 >
 > 配套内核（20 处稳定性修复）：[yangw9182-del/clash-rs](https://github.com/yangw9182-del/clash-rs)
 
-**实测设备**：DSG-AX3000（IPQ5018, 128MB RAM, OpenWrt 19.07），连续运行 30+ 天无崩溃。
+**实测设备**：DSG-AX3000（IPQ5018, 256MB RAM, OpenWrt 19.07），连续运行 30+ 天无崩溃。
 
 ---
 
@@ -33,7 +33,7 @@
 ## 🚀 快速部署（OpenWrt）
 
 ### 0. 前提
-- OpenWrt 路由器（128MB+ 内存）
+- OpenWrt 路由器（256MB+ 内存）
 - clash-rs 内核[已编译](https://github.com/yangw9182-del/clash-rs)好
 
 ### 1. 上传文件（电脑到路由器）

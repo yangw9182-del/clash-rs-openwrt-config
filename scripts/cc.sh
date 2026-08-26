@@ -1260,13 +1260,10 @@ do_test() {
 
 # 通过API热重载配置 (clash-rs 失败时保留旧配置继续运行)
 _reload_config() {
-    local result
-    result=$(curl -s -X PUT -H "Authorization: Bearer $SECRET" -H "Content-Type: application/json" \
-        -d "{\"path\":\"$CONFIG\"}" "http://${API_HOST}:${API_PORT}/configs" 2>/dev/null)
-    if [ -n "$result" ] && echo "$result" | grep -qiE '"message".*error|invalid|forbidden|not found|parse'; then
-        return 1
-    fi
-    return 0
+    # 注意: 禁用 PUT /configs 热重载（会导致 1053 Address in use 断网）
+    # 改配置后用 init.d restart 完整重启
+    /etc/init.d/clash-rs restart >/dev/null 2>&1
+    return $?
 }
 
 # 从节点定义文本中提取name (支持 flow/block style)
@@ -4960,22 +4957,54 @@ _sub_list() {
 
 _sub_update() {
     [ ! -s "$_subfile" ] && { pl "${R}  无订阅${N}"; return; }
-    pl "${C}  更新所有订阅...${N}"
+
+    # 列出所有订阅，让用户选择更新哪个
+    local cnt=$(grep -cE '.' "$_subfile" 2>/dev/null)
+    [ "$cnt" -eq 0 ] && { pl "${R}  无订阅${N}"; return; }
+
+    _sub_list
+    echo ""
+    printf "  选择更新 (1-${cnt}, 回车=全部, 0=取消): "
+    read sel
+    [ "$sel" = "0" ] && return
+
     local total=0
     local tmpnodes='/tmp/sub_all_nodes.txt'
     > "$tmpnodes"
-    while IFS= read -r url; do
-        [ -z "$url" ] && continue
+
+    if [ -n "$sel" ] && [ "$sel" -ge 1 ] 2>/dev/null && [ "$sel" -le "$cnt" ]; then
+        # 更新单个订阅（用 sed 行号取指定行）
+        local url=$(sed -n "${sel}p" "$_subfile")
+        [ -z "$url" ] && { pl "${R}  无效选择${N}"; rm -f "$tmpnodes"; return; }
+        pl "${C}  更新第 ${sel} 个订阅...${N}"
         local nodes=$(_sub_download_one "$url")
         if [ -n "$nodes" ]; then
             echo "$nodes" >> "$tmpnodes"
             local n=$(echo "$nodes" | grep -c 'name:')
-            total=$((total+n))
-            pl "  ${G}OK${N} $(echo "$url" | cut -c1-50)... (${n}节点)"
+            total=$n
+            pl "  ${G}OK${N} ($n 节点)"
         else
             pl "  ${R}FAIL${N} $(echo "$url" | cut -c1-50)..."
+            rm -f "$tmpnodes"
+            return
         fi
-    done < "$_subfile"
+    else
+        # 更新全部
+        pl "${C}  更新所有订阅...${N}"
+        while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            local nodes=$(_sub_download_one "$url")
+            if [ -n "$nodes" ]; then
+                echo "$nodes" >> "$tmpnodes"
+                local n=$(echo "$nodes" | grep -c 'name:')
+                total=$((total+n))
+                pl "  ${G}OK${N} $(echo "$url" | cut -c1-50)... (${n}节点)"
+            else
+                pl "  ${R}FAIL${N} $(echo "$url" | cut -c1-50)..."
+            fi
+        done < "$_subfile"
+    fi
+
     if [ "$total" -eq 0 ]; then
         pl "${R}  无有效节点${N}"
         rm -f "$tmpnodes"
@@ -5019,16 +5048,25 @@ _sub_download_one() {
     local tmp='/tmp/sub_dl.txt'
     local host=$(echo "$url" | sed -n 's|https://\([^/:]*\).*|\1|p')
     local resolve_opts=""
+    local proxy_opts=""
 
     # 绕过 fake-ip: 先用直连 DNS 解析域名，再用 --resolve 下载
     if [ -n "$host" ]; then
-        local real_ip=$(nslookup "$host" 119.29.29.29 2>/dev/null | grep 'Address' | grep -v '119.29' | grep -v '127.0.0' | head -1 | awk '{print $NF}')
+        # 尝试 223.5.5.5（阿里 DNS，对国外 CDN 兼容性好）
+        local real_ip=$(nslookup "$host" 223.5.5.5 2>/dev/null | grep 'Address' | grep -v '223.5' | grep -v '127.0.0' | head -1 | awk '{print $NF}')
+        if [ -z "$real_ip" ] || [ "$real_ip" = "198.18.0.24" ]; then
+            # 再试 114.114.114.114
+            real_ip=$(nslookup "$host" 114.114.114.114 2>/dev/null | grep 'Address' | grep -v '114.114' | grep -v '127.0.0' | head -1 | awk '{print $NF}')
+        fi
         if [ -n "$real_ip" ] && [ "$real_ip" != "198.18.0.24" ]; then
             resolve_opts="--resolve ${host}:443:${real_ip}"
+        else
+            # 直连 DNS 解析失败，走代理下载（订阅域名多在境外 CDN）
+            proxy_opts="-x http://127.0.0.1:7890"
         fi
     fi
 
-    curl -s -L --connect-timeout 15 --max-time 30 $resolve_opts -o "$tmp" "$url" 2>/dev/null
+    curl -s -L --connect-timeout 15 --max-time 30 $proxy_opts $resolve_opts -o "$tmp" "$url" 2>/dev/null
     [ ! -s "$tmp" ] && { echo ''; return; }
     local first=$(head -1 "$tmp")
     if echo "$first" | grep -qE 'proxies:|proxy-groups:|mixed-port:'; then
