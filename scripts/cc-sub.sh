@@ -5016,9 +5016,60 @@ _sub_update() {
     case "$confirm" in y|Y) ;; *) pl "  取消"; rm -f "$tmpnodes"; return ;; esac
     local bakfile="$CONFIG.bak.sub.$(date +%s)"
     cp "$CONFIG" "$bakfile" 2>/dev/null
-    awk -v nodes="$(cat $tmpnodes)" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" 2>/dev/null
-    if [ $? -ne 0 ] || [ ! -s "$CONFIG.tmp" ]; then
-        pl "${R}  配置合并失败 (awk 处理出错), 已恢复备份${N}"
+
+    # 解析节点名（URL解码+过滤无用节点名）
+    local node_names=""
+    local real_nodes=""
+    while IFS= read -r line; do
+        echo "$line" | grep -qE 'name:.*(剩余|到期|重置|套餐|%E5%89%A9|%E5%88%B0|%E9%87%8D|%E5%A5%97)' && continue
+        local name=$(echo "$line" | sed -n 's/.*name: "\([^"]*\)".*/\1/p')
+        [ -z "$name" ] && continue
+        local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
+        [ -z "$decoded" ] && decoded="$name"
+        echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
+        local new_line=$(echo "$line" | sed "s/name: \"$name\"/name: \"$decoded\"/" 2>/dev/null)
+        [ -z "$new_line" ] && new_line="$line"
+        node_names="$node_names
+$decoded"
+        real_nodes="$real_nodes
+$new_line"
+    done < "$tmpnodes"
+
+    # 重建 config（替换 proxies 段，保留其余配置）
+    local header=$(sed -n '1,/^proxies:/p' "$CONFIG" | head -n -1)
+    local rules=$(sed -n '/^rules:/,$p' "$CONFIG")
+    {
+        echo "$header"
+        echo ""
+        echo "proxies:"
+        echo "$real_nodes" | grep -v '^$'
+        echo ""
+        echo "proxy-groups:"
+        echo "  - name: PROXY"
+        echo "    type: select"
+        echo "    proxies:"
+        echo "      - AUTO"
+        echo "      - DIRECT"
+        echo "$node_names" | grep -v '^$' | while IFS= read -r n; do
+            echo "      - \"$n\""
+        done
+        echo ""
+        echo "  - name: AUTO"
+        echo "    type: url-test"
+        echo "    url: http://cp.cloudflare.com/generate_204"
+        echo "    interval: 600"
+        echo "    tolerance: 100"
+        echo "    timeout: 5"
+        echo "    proxies:"
+        echo "$node_names" | grep -v '^$' | while IFS= read -r n; do
+            echo "      - \"$n\""
+        done
+        echo ""
+        echo "$rules"
+    } > "$CONFIG.tmp" 2>/dev/null
+
+    if [ ! -s "$CONFIG.tmp" ]; then
+        pl "${R}  配置生成失败, 已恢复备份${N}"
         cp "$bakfile" "$CONFIG" 2>/dev/null
         rm -f "$tmpnodes" "$CONFIG.tmp"
         return
@@ -5200,8 +5251,14 @@ _sub_auto_update() {
         local crontab_out=$(crontab -l 2>/dev/null)
         local sub_cron=$(echo "$crontab_out" | grep 'sub-update' | head -1)
         if [ -n "$sub_cron" ]; then
-            local sched=$(echo "$sub_cron" | awk '{print $1}')
-            echo "当前: $sched (每 $interval 小时)"
+            local sched=$(echo "$sub_cron" | awk '{print $1, $2}')
+            if echo "$interval" | grep -qE '^[0-9]{1,2}:[0-9]{2}$'; then
+                echo "当前: 每天 ${interval} 自动更新"
+            elif echo "$sched" | grep -qE '^[0-9]+ [0-9]+ \* \* \*'; then
+                echo "当前: 每天 $sched 自动更新"
+            else
+                echo "当前: $sched (每 $interval 小时)"
+            fi
         else
             echo "当前: 未启用自动更新"
         fi
@@ -5216,22 +5273,40 @@ _sub_auto_update() {
             pl "${G}已关闭订阅自动更新${N}"
             return
         fi
-        # 设置间隔（小时）
-        local sched="*/$interval * * *"
-        # 如果是 24 的因数，用每天
-        if [ "$interval" = "24" ]; then sched="0 0 * * *"
-        elif [ "$interval" = "12" ]; then sched="0 */12 * * *"
-        elif [ "$interval" = "6" ]; then sched="0 */6 * * *"
-        elif [ "$interval" = "4" ]; then sched="0 */4 * * *"
-        elif [ "$interval" = "2" ]; then sched="0 */2 * * *"
-        elif [ "$interval" = "1" ]; then sched="0 * * * *"
+        # 支持 "HH:MM" 格式：每天指定时刻
+        if echo "$interval" | grep -qE '^[0-9]{1,2}:[0-9]{2}$'; then
+            local _hh=$(echo "$interval" | cut -d: -f1)
+            local _mm=$(echo "$interval" | cut -d: -f2)
+            # 校验范围
+            if [ "$_hh" -ge 0 ] 2>/dev/null && [ "$_hh" -le 23 ] 2>/dev/null && \
+               [ "$_mm" -ge 0 ] 2>/dev/null && [ "$_mm" -le 59 ] 2>/dev/null; then
+                local sched="$_mm $_hh * * *"
+            else
+                pl "${R}  时间无效 (小时0-23, 分钟0-59)${N}"
+                return
+            fi
+        else
+            # 设置间隔（小时）
+            local sched="*/$interval * * *"
+            # 如果是 24 的因数，用每天
+            if [ "$interval" = "24" ]; then sched="0 0 * * *"
+            elif [ "$interval" = "12" ]; then sched="0 */12 * * *"
+            elif [ "$interval" = "6" ]; then sched="0 */6 * * *"
+            elif [ "$interval" = "4" ]; then sched="0 */4 * * *"
+            elif [ "$interval" = "2" ]; then sched="0 */2 * * *"
+            elif [ "$interval" = "1" ]; then sched="0 * * * *"
+            fi
         fi
         # 先删旧的
         _crontab_out=$(crontab -l 2>/dev/null)
         [ -n "$_crontab_out" ] && echo "$_crontab_out" | grep -v 'sub-update' | crontab -
         # 加新的
         echo "$sched /etc/clash-rs/cc.sh sub-update >/dev/null 2>&1" | crontab -
-        pl "${G}已设置: 每 $interval 小时自动更新订阅${N}"
+        if echo "$interval" | grep -qE '^[0-9]{1,2}:[0-9]{2}$'; then
+            pl "${G}已设置: 每天 ${interval} 自动更新订阅${N}"
+        else
+            pl "${G}已设置: 每 $interval 小时自动更新订阅${N}"
+        fi
         return
     fi
 
@@ -5249,6 +5324,7 @@ _sub_auto_update() {
         pl "  ${W}5${N}. 每 12 小时"
         pl "  ${W}6${N}. 每天 0:00"
         pl "  ${W}7${N}. 自定义 (输入任意小时数)"
+        pl "  ${W}8${N}. 指定时间 (每天 HH:MM, 如 03:30)"
         pl "  ${W}0${N}. 关闭自动更新"
         line
         printf '\n  选择: '
@@ -5265,6 +5341,12 @@ _sub_auto_update() {
                 read custom_h
                 [ -n "$custom_h" ] && [ "$custom_h" -ge 1 ] 2>/dev/null && _sub_auto_update $custom_h; break
                 pl "${R}  无效${N}"
+                ;;
+            8)
+                printf "  输入每天更新时间 (HH:MM, 如 03:30): "
+                read custom_time
+                [ -n "$custom_time" ] && echo "$custom_time" | grep -qE '^[0-9]{1,2}:[0-9]{2}$' && _sub_auto_update "$custom_time"; break
+                pl "${R}  格式错误, 例如 03:30 或 14:05${N}"
                 ;;
             0) _sub_auto_update off; break ;;
             *) pl "${R}  无效${N}" ;;
