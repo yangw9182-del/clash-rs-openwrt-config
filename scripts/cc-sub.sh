@@ -2964,7 +2964,7 @@ do_patch() {
         pl "${R}  API返回错误: ${result}${N}"
         return 1
     fi
-    sleep 0.5
+    sleep 1
     # 持久化到 config.yaml (修改顶层字段)
     if grep -qE "^${field}:" "$CONFIG" 2>/dev/null; then
         # 字符串值用引号, 数字/布尔不加
@@ -5029,6 +5029,8 @@ _sub_update() {
         echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
         local new_line=$(echo "$line" | sed "s/name: \"$name\"/name: \"$decoded\"/" 2>/dev/null)
         [ -z "$new_line" ] && new_line="$line"
+        # 去重：节点名已在列表则跳过（防止 duplicated proxy name 崩溃）
+        echo "$node_names" | grep -Fqx "$decoded" && continue
         node_names="$node_names
 $decoded"
         real_nodes="$real_nodes
@@ -5297,11 +5299,17 @@ _sub_auto_update() {
             elif [ "$interval" = "1" ]; then sched="0 * * * *"
             fi
         fi
-        # 先删旧的
+        # 先删旧的 sub-update 行（保留其他任务）
         _crontab_out=$(crontab -l 2>/dev/null)
-        [ -n "$_crontab_out" ] && echo "$_crontab_out" | grep -v 'sub-update' | crontab -
-        # 加新的
-        echo "$sched /etc/clash-rs/cc.sh sub-update >/dev/null 2>&1" | crontab -
+        if [ -n "$_crontab_out" ]; then
+            echo "$_crontab_out" | grep -v 'sub-update' > /tmp/ct.new 2>/dev/null
+        else
+            : > /tmp/ct.new
+        fi
+        # 追加新的 sub-update 行（不能整体替换 crontab！）
+        echo "$sched /etc/clash-rs/cc.sh sub-update >/dev/null 2>&1" >> /tmp/ct.new
+        crontab /tmp/ct.new 2>/dev/null
+        rm -f /tmp/ct.new
         if echo "$interval" | grep -qE '^[0-9]{1,2}:[0-9]{2}$'; then
             pl "${G}已设置: 每天 ${interval} 自动更新订阅${N}"
         else
@@ -5395,6 +5403,8 @@ _sub_update_all() {
         echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
         local new_line=$(echo "$line" | sed "s/name: \"$name\"/name: \"$decoded\"/" 2>/dev/null)
         [ -z "$new_line" ] && new_line="$line"
+        # 去重：节点名已在列表则跳过（防止 duplicated proxy name 崩溃）
+        echo "$node_names" | grep -Fqx "$decoded" && continue
         node_names="$node_names
 $decoded"
         real_nodes="$real_nodes

@@ -3005,7 +3005,7 @@ do_patch() {
         pl "${R}  API返回错误: ${result}${N}"
         return 1
     fi
-    sleep 0.5
+    sleep 1
     # 持久化到 config.yaml (修改顶层字段)
     if grep -qE "^${field}:" "$CONFIG" 2>/dev/null; then
         # 字符串值用引号, 数字/布尔不加
@@ -3015,8 +3015,7 @@ do_patch() {
                 case "$value" in
                     rule|global|direct|trace|debug|info|warning|error|silent|true|false|localhost|\*)
                         cp "$CONFIG" "$CONFIG.cc.bak.$(date +%s)" 2>/dev/null
-    local safe_value=$(echo "$value" | sed 's/\/\\/g; s/[&|]/\&/g')
-    sed -i "s|^${field}:.*|${field}: ${safe_value}|" "$CONFIG" 2>/dev/null
+    sed -i "s|^${field}:.*|${field}: ${value}|" "$CONFIG" 2>/dev/null
     if [ $? -ne 0 ]; then
         echo "  !! do_patch failed to write $field" >&2
     fi
@@ -3028,8 +3027,7 @@ do_patch() {
                 ;;
             *)
                 cp "$CONFIG" "$CONFIG.cc.bak.$(date +%s)" 2>/dev/null
-    local safe_value=$(echo "$value" | sed 's/\/\\/g; s/[&|]/\&/g')
-    sed -i "s|^${field}:.*|${field}: ${safe_value}|" "$CONFIG" 2>/dev/null
+    sed -i "s|^${field}:.*|${field}: ${value}|" "$CONFIG" 2>/dev/null
     if [ $? -ne 0 ]; then
         echo "  !! do_patch failed to write $field" >&2
     fi
