@@ -5038,7 +5038,7 @@ $new_line"
     done < "$tmpnodes"
 
     # 重建 config（替换 proxies 段，保留其余配置）
-    local header=$(sed -n '1,/^proxies:/p' "$CONFIG" | head -n -1)
+    local header=$(sed -n '1,/^proxies:/p' "$CONFIG" | sed '$d')
     local rules=$(sed -n '/^rules:/,$p' "$CONFIG")
     {
         echo "$header"
@@ -5090,19 +5090,78 @@ $new_line"
 _sub_update_one() {
     local url="$1"
     local nodes=$(_sub_download_one "$url")
-    if [ -n "$nodes" ]; then
-        local n=$(echo "$nodes" | grep -c 'name:')
-        pl "${G}  下载成功: $n 个节点${N}"
-        pl "${Y}  替换到配置中生效? (y/N)${N}"
-        printf '  > '
-        read confirm
-        case "$confirm" in y|Y) ;; *) return ;; esac
-        cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
-        awk -v nodes="$nodes" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-        _reload_config && pl "${G}  [$(date '+%H:%M:%S')] OK${N}" || pl "${R}  FAIL${N}"
-    else
+    if [ -z "$nodes" ]; then
         pl "${R}  下载失败${N}"
+        return
     fi
+    local n=$(echo "$nodes" | grep -c 'name:')
+    pl "${G}  下载成功: $n 个节点${N}"
+    pl "${Y}  替换到配置中生效? (y/N)${N}"
+    printf '  > '
+    read confirm
+    case "$confirm" in [Yy]*) ;; *) return ;; esac
+
+    local bakfile="$CONFIG.bak.sub.$(date +%s)"
+    cp "$CONFIG" "$bakfile" 2>/dev/null
+
+    # 解析节点名（URL解码+过滤+去重）
+    local node_names=""
+    local real_nodes=""
+    local tmpnodes='/tmp/sub_one_nodes.txt'
+    echo "$nodes" > "$tmpnodes"
+    while IFS= read -r line; do
+        echo "$line" | grep -qE 'name:.*(剩余|到期|重置|套餐|%E5%89%A9|%E5%88%B0|%E9%87%8D|%E5%A5%97)' && continue
+        local name=$(echo "$line" | sed -n 's/.*name: "\([^"]*\)".*/\1/p')
+        [ -z "$name" ] && continue
+        local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
+        [ -z "$decoded" ] && decoded="$name"
+        echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
+        local new_line=$(echo "$line" | sed "s|name: \"$name\"|name: \"$decoded\"|" 2>/dev/null)
+        [ -z "$new_line" ] && new_line="$line"
+        echo "$node_names" | grep -Fqx "$decoded" && continue
+        node_names="$node_names
+$decoded"
+        real_nodes="$real_nodes
+$new_line"
+    done < "$tmpnodes"
+    rm -f "$tmpnodes"
+
+    # 重建 config
+    local header=$(sed -n '1,/^proxies:/p' "$CONFIG" | sed '$d')
+    local rules=$(sed -n '/^rules:/,$p' "$CONFIG")
+    {
+        echo "$header"
+        echo ""
+        echo "proxies:"
+        echo "$real_nodes" | grep -v '^$'
+        echo ""
+        echo "proxy-groups:"
+        echo "  - name: PROXY"
+        echo "    type: select"
+        echo "    proxies:"
+        echo "      - AUTO"
+        echo "      - DIRECT"
+        echo "$node_names" | grep -v '^$' | while IFS= read -r n; do echo "      - \"$n\""; done
+        echo ""
+        echo "  - name: AUTO"
+        echo "    type: url-test"
+        echo "    url: http://cp.cloudflare.com/generate_204"
+        echo "    interval: 600"
+        echo "    tolerance: 100"
+        echo "    timeout: 5"
+        echo "    proxies:"
+        echo "$node_names" | grep -v '^$' | while IFS= read -r n; do echo "      - \"$n\""; done
+        echo ""
+        echo "$rules"
+    } > "$CONFIG.tmp" 2>/dev/null
+
+    if [ ! -s "$CONFIG.tmp" ]; then
+        pl "${R}  配置生成失败${N}"
+        cp "$bakfile" "$CONFIG" 2>/dev/null
+        return
+    fi
+    mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null
+    _reload_config && pl "${G}  [$(date '+%H:%M:%S')] OK${N}" || pl "${R}  FAIL${N}"
 }
 
 _sub_download_one() {
@@ -5211,10 +5270,11 @@ _sub_single() {
     pl "${Y}  添加? (y/N)${N}"
     printf '  > '
     read confirm
-    case "$confirm" in y|Y) ;; *) return ;; esac
-    cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
-    awk -v nodes="$line" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-    _reload_config && pl "${G}  已添加${N}" || { pl "${R}  FAIL${N}"; cp "$CONFIG.bak.sub."* "$CONFIG" 2>/dev/null; }
+    case "$confirm" in [Yy]*) ;; *) return ;; esac
+    local bakfile="$CONFIG.bak.single.$(date +%s)"
+    cp "$CONFIG" "$bakfile" 2>/dev/null
+    sed -i "/^proxy-groups:/i\  $line" "$CONFIG" 2>/dev/null
+    _reload_config && pl "${G}  已添加${N}" || { pl "${R}  FAIL${N}"; cp "$bakfile" "$CONFIG" 2>/dev/null; }
 }
 
 _sub_del() {
@@ -5347,13 +5407,13 @@ _sub_auto_update() {
             7)
                 printf "  输入间隔小时数 (如 3=每3小时, 8=每8小时): "
                 read custom_h
-                [ -n "$custom_h" ] && [ "$custom_h" -ge 1 ] 2>/dev/null && _sub_auto_update $custom_h; break
+                [ -n "$custom_h" ] && [ "$custom_h" -ge 1 ] 2>/dev/null && _sub_auto_update $custom_h && break
                 pl "${R}  无效${N}"
                 ;;
             8)
                 printf "  输入每天更新时间 (HH:MM, 如 03:30): "
                 read custom_time
-                [ -n "$custom_time" ] && echo "$custom_time" | grep -qE '^[0-9]{1,2}:[0-9]{2}$' && _sub_auto_update "$custom_time"; break
+                [ -n "$custom_time" ] && echo "$custom_time" | grep -qE '^[0-9]{1,2}:[0-9]{2}$' && _sub_auto_update "$custom_time" && break
                 pl "${R}  格式错误, 例如 03:30 或 14:05${N}"
                 ;;
             0) _sub_auto_update off; break ;;
@@ -5412,7 +5472,7 @@ $new_line"
     done < "$allnodes"
 
     # 从旧 config 提取 header 和 rules
-    local header=$(sed -n '1,/^proxies:/p' "$CONFIG" | head -n -1)
+    local header=$(sed -n '1,/^proxies:/p' "$CONFIG" | sed '$d')
     local rules=$(sed -n '/^rules:/,$p' "$CONFIG")
 
     # 生成新 config
@@ -5436,7 +5496,7 @@ $new_line"
         echo "    type: url-test"
         echo "    url: http://cp.cloudflare.com/generate_204"
         echo "    interval: 600"
-        echo "    tolerance: 50"
+        echo "    tolerance: 100"
         echo "    timeout: 5"
         echo "    proxies:"
         echo "$node_names" | grep -v '^$' | while IFS= read -r n; do
