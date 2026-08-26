@@ -2493,6 +2493,41 @@ do_doctor() {
 }
 
 # ============================================================
+# 运行时间 (cc uptime)
+# ============================================================
+do_uptime() {
+    # clash-rs 运行时间
+    local clash_up=$(get_uptime)
+    pl "${C}  ═══ 运行时间 ═══${N}"
+
+    # 路由器开机时间
+    if [ -f /proc/uptime ]; then
+        local sec=$(cat /proc/uptime | awk '{print int($1)}')
+        local day=$((sec / 86400))
+        local hour=$(( (sec % 86400) / 3600 ))
+        local min=$(( (sec % 3600) / 60 ))
+        local router_up=""
+        [ "$day" -gt 0 ] && router_up="${day}天"
+        router_up="${router_up}${hour}时${min}分"
+        local boot_time=$(date -d "@$(($(date +%s) - sec))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+        pl "  路由器: 已运行 ${router_up} (开机时间: ${boot_time:-未知})"
+    fi
+
+    # clash-rs 运行时间 (从 /var/run/clash_start_time)
+    if [ -f /var/run/clash_start_time ]; then
+        local start=$(cat /var/run/clash_start_time)
+        local start_fmt=$(date -d "@$start" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+        pl "  clash-rs: 已运行 ${clash_up:-未知} (启动时间: ${start_fmt:-$start})"
+    else
+        pl "  clash-rs: ${clash_up:-未知}"
+    fi
+
+    # 最近重启
+    local last_reboot=$(last reboot 2>/dev/null | head -2 | tail -1 | awk '{print $3,$4,$5,$6}')
+    [ -n "$last_reboot" ] && pl "  上次重启: $last_reboot" || pl "  (无重启记录)"
+}
+
+# ============================================================
 # C13: 系统信息 (cc sysinfo)
 # ============================================================
 do_sysinfo() {
@@ -4976,6 +5011,7 @@ case "$1" in
             pl "${R}  用法: cc dns (进入子菜单) 或 cc dns-query <domain> (DNS测试)${N}"
         fi
         ;;
+    uptime)   do_uptime ;;
     profile)  do_profile ;;
     clashconf) do_clash_conf ;;
     autogroup) do_autogroup ;;

@@ -5010,16 +5010,17 @@ _sub_update() {
         rm -f "$tmpnodes"
         return
     fi
-    pl "${Y}  共 $total 个节点, 合并? (y/N)${N}"
+    pl "${Y}  共 $total 个节点, 替换到配置中生效? (y/N)${N}"
     printf '  > '
     read confirm
     case "$confirm" in y|Y) ;; *) pl "  取消"; rm -f "$tmpnodes"; return ;; esac
     cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
     awk -v nodes="$(cat $tmpnodes)" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
     if _reload_config; then
-        pl "${G}  更新成功, $total 个节点${N}"
+        local ts=$(date '+%H:%M:%S')
+        pl "${G}  [${ts}] 更新成功, $total 个节点已替换到配置中${N}"
     else
-        pl "${R}  失败, 恢复${N}"
+        pl "${R}  失败, 已恢复备份${N}"
         cp "$CONFIG.bak.sub."* "$CONFIG" 2>/dev/null
     fi
     rm -f "$tmpnodes"
@@ -5031,13 +5032,13 @@ _sub_update_one() {
     if [ -n "$nodes" ]; then
         local n=$(echo "$nodes" | grep -c 'name:')
         pl "${G}  下载成功: $n 个节点${N}"
-        pl "${Y}  合并? (y/N)${N}"
+        pl "${Y}  替换到配置中生效? (y/N)${N}"
         printf '  > '
         read confirm
         case "$confirm" in y|Y) ;; *) return ;; esac
         cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
         awk -v nodes="$nodes" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-        _reload_config && pl "${G}  OK${N}" || pl "${R}  FAIL${N}"
+        _reload_config && pl "${G}  [$(date '+%H:%M:%S')] OK${N}" || pl "${R}  FAIL${N}"
     else
         pl "${R}  下载失败${N}"
     fi
