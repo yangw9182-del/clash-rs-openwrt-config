@@ -121,7 +121,9 @@ get_pid() { cat $PID_FILE 2>/dev/null; }
 
 is_running() {
     PID=$(get_pid)
-    [ -n "$PID" ] && kill -0 $PID 2>/dev/null
+    [ -z "$PID" ] && return 1
+    [ -f "/proc/$PID/comm" ] && ! grep -q "clash-rs" "/proc/$PID/comm" 2>/dev/null && return 1
+    kill -0 $PID 2>/dev/null
 }
 
 get_rss() {
@@ -358,6 +360,7 @@ fi
             # 没有 exit 0, 直接追加
             printf '%s\n' "$new_block" >> "$tmp" 2>/dev/null
         fi
+        cp "$f" "$f.bak" 2>/dev/null
         mv "$tmp" "$f" 2>/dev/null
         chmod +x "$f" 2>/dev/null
         return 0
@@ -1072,7 +1075,7 @@ test_nodes_concurrent() {
 
             # 非SS2022: 使用clash-rs API delay test (Trojan/AnyTLS等正常工作)
             if [ "$is_ss2022" = "false" ]; then
-                delay=$(api "/proxies/$encoded_n/delay?timeout=${timeout}&url=http://www.gstatic.com/generate_204" 2>/dev/null | grep -o '"delay":[0-9]*' | cut -d: -f2)
+                delay=$(api "/proxies/$encoded_n/delay?timeout=${timeout}&url=http://cp.cloudflare.com/generate_204" 2>/dev/null | grep -o '"delay":[0-9]*' | cut -d: -f2)
             fi
 
             if [ -n "$delay" ] && [ "$delay" -gt 0 ] 2>/dev/null; then
@@ -1260,10 +1263,13 @@ do_test() {
 
 # 通过API热重载配置 (clash-rs 失败时保留旧配置继续运行)
 _reload_config() {
-    # 注意: 禁用 PUT /configs 热重载（会导致 1053 Address in use 断网）
-    # 改配置后用 init.d restart 完整重启
-    /etc/init.d/clash-rs restart >/dev/null 2>&1
-    return $?
+    local result
+    result=$(curl -s -X PUT -H "Authorization: Bearer $SECRET" -H "Content-Type: application/json" \
+        -d "{\"path\":\"$CONFIG\"}" "http://${API_HOST}:${API_PORT}/configs" 2>/dev/null)
+    if [ -n "$result" ] && echo "$result" | grep -qiE '"message".*error|invalid|forbidden|not found|parse'; then
+        return 1
+    fi
+    return 0
 }
 
 # 从节点定义文本中提取name (支持 flow/block style)
@@ -2973,7 +2979,12 @@ do_patch() {
                 # 字符串: 若是纯字母数字/IP/* 不加引号, 否则加引号
                 case "$value" in
                     rule|global|direct|trace|debug|info|warning|error|silent|true|false|localhost|\*)
-                        sed -i "s|^${field}:.*|${field}: ${value}|" "$CONFIG" 2>/dev/null
+                        cp "$CONFIG" "$CONFIG.cc.bak.$(date +%s)" 2>/dev/null
+    local safe_value=$(echo "$value" | sed 's/\/\\/g; s/[&|]/\&/g')
+    sed -i "s|^${field}:.*|${field}: ${safe_value}|" "$CONFIG" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo "  !! do_patch failed to write $field" >&2
+    fi
                         ;;
                     *)
                         sed -i "s|^${field}:.*|${field}: \"${value}\"|" "$CONFIG" 2>/dev/null
@@ -2981,7 +2992,12 @@ do_patch() {
                 esac
                 ;;
             *)
-                sed -i "s|^${field}:.*|${field}: ${value}|" "$CONFIG" 2>/dev/null
+                cp "$CONFIG" "$CONFIG.cc.bak.$(date +%s)" 2>/dev/null
+    local safe_value=$(echo "$value" | sed 's/\/\\/g; s/[&|]/\&/g')
+    sed -i "s|^${field}:.*|${field}: ${safe_value}|" "$CONFIG" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo "  !! do_patch failed to write $field" >&2
+    fi
                 ;;
         esac
         pl "${G}  已持久化到 config.yaml${N}"
@@ -3584,7 +3600,7 @@ _patch_toplevel() {
 #                 自适应模式: 连续12轮无切换且平均差>20ms时自动降到20ms
 #                 切换后恢复到设定值
 #   - interval:   自动测速间隔(秒), 每隔此时间自动测速并选择最快节点
-#   - url:        测速URL, 默认 http://www.gstatic.com/generate_204
+#   - url:        测速URL, 默认 http://cp.cloudflare.com/generate_204
 #   - 强制切换:    手动测速后(面板/cc test auto)强制切换到最低延迟节点(忽略tolerance)
 #   - 流量保护:    代理流量>250KB/s时跳过自动切换, 避免打断下载/视频
 # 注意: 修改后需重启clash-rs生效 (proxy-groups参数不支持热重载)
@@ -3596,12 +3612,21 @@ do_autogroup() {
         # AUTO组配置格式:
         #   - name: AUTO
         #     type: url-test
-        #     url: http://www.gstatic.com/generate_204
+        #     url: http://cp.cloudflare.com/generate_204
         #     interval: 300
         #     tolerance: 30
-        ag_tol=$(sed -n '/- name: AUTO/,/^- name:/p' "$CONFIG" 2>/dev/null | grep -oE 'tolerance:[[:space:]]*[0-9]+' | head -1 | sed 's/.*:[[:space:]]*//')
-        ag_int=$(sed -n '/- name: AUTO/,/^- name:/p' "$CONFIG" 2>/dev/null | grep -oE 'interval:[[:space:]]*[0-9]+' | head -1 | sed 's/.*:[[:space:]]*//')
-        ag_url=$(sed -n '/- name: AUTO/,/^- name:/p' "$CONFIG" 2>/dev/null | grep -oE 'url:[[:space:]]*.*' | head -1 | sed 's/url:[[:space:]]*//; s/[\" ]//g')
+        # 用awk精确提取AUTO组内容 (避免误读其他组)
+        local auto_yaml
+        auto_yaml=$(awk '
+            BEGIN { in_auto = 0 }
+            /^  - name: AUTO[[:space:]]*$/ { in_auto = 1 }
+            in_auto && /^  - name:/ && !/AUTO/ { in_auto = 0 }
+            in_auto && /^[a-z]/ { in_auto = 0 }
+            in_auto { print }
+        ' "$CONFIG" 2>/dev/null)
+        ag_tol=$(echo "$auto_yaml" | grep -oE 'tolerance:[[:space:]]*[0-9]+' | head -1 | sed 's/.*:[[:space:]]*//')
+        ag_int=$(echo "$auto_yaml" | grep -oE 'interval:[[:space:]]*[0-9]+' | head -1 | sed 's/.*:[[:space:]]*//')
+        ag_url=$(echo "$auto_yaml" | grep -oE 'url:[[:space:]]*.*' | head -1 | sed 's/url:[[:space:]]*//; s/[\" ]//g')
 
         # 从API获取实时状态
         if is_running; then
@@ -3676,7 +3701,7 @@ do_autogroup() {
             3)
                 pl "${Y}  url: 测速用的URL, 需返回HTTP 204${N}"
                 pl "  ${Y}推荐:${N}"
-                pl "    http://www.gstatic.com/generate_204 (Google, 默认)"
+                pl "    http://cp.cloudflare.com/generate_204 (Cloudflare, 默认)"
                 pl "    https://cp.cloudflare.com/generate_204 (Cloudflare)"
                 pl "    http://www.google.com/generate_204"
                 printf "  新URL (回车=取消): "; read newv
@@ -3704,10 +3729,10 @@ do_autogroup() {
                         # 调用API测速 (会触发force_fastest标志)
                         local test_result
                         test_result=$(curl -s -H "Authorization: Bearer $SECRET" \
-                            "http://${API_HOST}:${API_PORT}/proxies/AUTO/delay?url=$(urlencode "${ag_url:-http://www.gstatic.com/generate_204}")&timeout=5000" 2>/dev/null)
+                            "http://${API_HOST}:${API_PORT}/proxies/AUTO/delay?url=$(urlencode "${ag_url:-http://cp.cloudflare.com/generate_204}")&timeout=5000" 2>/dev/null)
                         pl "  测速结果: ${G}${test_result}${N}"
                         # 触发实际流量让force_fastest生效
-                        curl -s -o /dev/null --connect-timeout 5 http://www.gstatic.com/generate_204 2>/dev/null
+                        curl -s -o /dev/null --connect-timeout 5 http://cp.cloudflare.com/generate_204 2>/dev/null
                         sleep 1
                         # 查看切换后的节点
                         local new_now
@@ -3756,23 +3781,40 @@ do_autogroup() {
     done
 }
 
-# 修改AUTO组参数 (sed操作config.yaml + 重启)
+# 修改AUTO组参数 (awk精确定位AUTO组 + 修改字段 + 重启)
 # $1=字段名(tolerance/interval/url) $2=新值
+# 使用awk精确匹配AUTO组范围, 避免误改其他组
+# awk逻辑: 遇到"  - name: AUTO"进入, 遇到下一个"  - name:"或顶层字段退出
 _patch_autogroup() {
     local field="$1" value="$2"
     # 备份
     cp "$CONFIG" "$CONFIG.bak"
-    # 在AUTO组范围内替换字段
-    # sed: 在 "- name: AUTO" 到下一个 "- name:" 之间替换
-    if [ "$field" = "url" ]; then
-        # URL可能包含特殊字符, 用不同方式
-        sed -i "/- name: AUTO/,/^- name:/{s|url:.*|url: ${value}|}" "$CONFIG"
-    else
-        sed -i "/- name: AUTO/,/^- name:/{s/${field}:.*/${field}: ${value}/}" "$CONFIG"
-    fi
-    # 验证修改
+
+    # awk精确修改AUTO组内的字段
+    # - in_auto=1时在AUTO组内, 替换 "    field: 旧值" 为 "    field: 新值"
+    # - proxy-groups组定义是 "  - name:" (2空格缩进)
+    # - 顶层字段(如rules:)以小写字母开头, 无缩进
+    awk -v f="$field" -v v="$value" '
+        BEGIN { in_auto = 0 }
+        /^  - name: AUTO[[:space:]]*$/ { in_auto = 1 }
+        in_auto && /^  - name:/ && !/AUTO/ { in_auto = 0 }
+        in_auto && /^[a-z]/ { in_auto = 0 }
+        in_auto && $0 ~ "^    "f":" {
+            # 直接赋值, 不用sub, 避免v中&字符被sub解释为"匹配的整个字符串"
+            $0 = "    " f ": " v
+        }
+        { print }
+    ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+
+    # 验证修改 (用同样的awk逻辑提取AUTO组)
     local verify
-    verify=$(sed -n '/- name: AUTO/,/^- name:/p' "$CONFIG" | grep -oE "${field}:[[:space:]]*[^[:space:]]+" | head -1)
+    verify=$(awk '
+        BEGIN { in_auto = 0 }
+        /^  - name: AUTO[[:space:]]*$/ { in_auto = 1 }
+        in_auto && /^  - name:/ && !/AUTO/ { in_auto = 0 }
+        in_auto && /^[a-z]/ { in_auto = 0 }
+        in_auto { print }
+    ' "$CONFIG" | grep -oE "${field}:[[:space:]]*[^[:space:]]+" | head -1)
     pl "  修改后: ${G}${verify:-未找到}${N}"
     # 重启生效
     pl "${Y}  重启clash-rs使配置生效...${N}"
@@ -4651,700 +4693,243 @@ show_version() {
 # 主菜单 (ShellCrash风格)
 # ============================================================
 
-# ============================================================
-# DNS 模式切换 (cc dns-mode)
-# ============================================================
-do_dns_mode() {
-    local cfg=/etc/clash-rs/config.yaml
-    local mode="${1:-}"
-
-    _show_dns_mode() {
-        if grep -q 'tls://'  2>/dev/null; then
-            echo "encrypted (DoT+DoH)"
-        elif grep -q 'dns-query'  2>/dev/null; then
-            echo "doh"
-        else
-            echo "udp"
-        fi
-    }
-
-    _apply_dns_mode() {
-        local m=$1
-        cp $cfg ${cfg}.bak.dnsmode.$(date +%s) 2>/dev/null
-
-        case "$m" in
-            udp)
-                # 删除 nameserver 段中的 DoH/DoT 行（只删 - https 和 - tls 开头的行）
-                sed -i '/^  nameserver:/,/^  [a-z]/{/- https/d; /- tls/d}' $cfg
-                # fallback 段：把 DoH/DoT 替换为 UDP
-                sed -i '/^  fallback:/,/^  [a-z]/{s|- https://[^ ]*|- 1.1.1.1|; s|- tls://[^ ]*|- 8.8.8.8|}' $cfg
-                ;;
-            doh)
-                # fallback 段：把 UDP 替换为 DoH
-                sed -i '/^  fallback:/,/^  [a-z]/{s|- 1.1.1.1|- https://1.1.1.1/dns-query|; s|- 8.8.8.8|- https://8.8.8.8/dns-query|}' $cfg
-                ;;
-            encrypted)
-                # fallback 段：把 UDP 替换为 DoT+DoH
-                sed -i '/^  fallback:/,/^  [a-z]/{s|- 1.1.1.1|- tls://1.1.1.1:853|; s|- 8.8.8.8|- https://8.8.8.8/dns-query|}' $cfg
-                ;;
-        esac
-
-        # 热重载
-        curl -s -X PUT http://127.0.0.1:9090/config -H "Authorization: Bearer clashrs2026" -H "Content-Type: application/json" -d "{"path":"$cfg"}" >/dev/null 2>&1
-    }
-
-    if [ -n "$mode" ]; then
-        _apply_dns_mode "$mode"
-        pl "DNS mode: ${G}$mode"
-        return
-    fi
-
+show_menu() {
     while true; do
-        local cur_mode
-        cur_mode=$(_show_dns_mode)
-        printf "
-"
+        # 获取运行状态
+        if is_running; then
+            PID=$(get_pid)
+            RSS=$(get_rss)
+            PROXY=$(get_proxy_now)
+            UPTIME=$(get_uptime)
+            run_status="${G}正在运行${N}"
+            mem_info="内存:${G}${RSS}MB${N}"
+            node_info="节点:${G}${PROXY:-未知}${N}"
+            time_info="运行:${G}${UPTIME}${N}"
+        else
+            run_status="${R}没有运行${N}"
+            mem_info=""
+            node_info=""
+            time_info=""
+        fi
+
+        # 开机自启检测
+        if ls /etc/rc.d/S*clash-rs >/dev/null 2>&1; then
+            auto_info="${G}已设置开机启动${N}"
+        else
+            auto_info="${R}未设置开机启动${N}"
+        fi
+
+        printf "\n"
         line
-        pl "${C}  DNS Mode Switch  current: ${G}${cur_mode}"
+        pl "${W}  欢迎使用 clash-rs 管理面板！${N}"
         line
-        pl "  1. UDP (119/223 + 1.1.1.1/8.8.8.8)"
-        pl "     stable, never disconnects (like normal router)"
-        pl "     no encryption, ISP can see queries"
-        pl "  2. DoH (1.1.1.1/8.8.8.8 over HTTPS)"
-        pl "     encrypted, anti-pollution"
-        pl "     TCP long-conn may disconnect"
-        pl "  3. DoT+DoH (tls:853 + DoH)"
-        pl "     strongest encryption"
-        pl "     port 853 may be blocked by ISP"
-        pl "  0. Back"
+        pl "  clash-rs服务${run_status}，${auto_info}"
+        if is_running; then
+            pl "  当前${mem_info}，已${time_info}"
+            pl "  当前${node_info}"
+            NH_VAL=$(cat $NODE_HEALTH_FILE 2>/dev/null)
+            if [ "$NH_VAL" = "1" ]; then
+                pl "  节点健康检查:${G}开${N} (每60秒自动切换故障节点)"
+            fi
+        fi
         line
-        printf "
-  Choice: "
-        read dm_choice
-        case "$dm_choice" in
-            1) _apply_dns_mode udp; pl "Switched to UDP"; pause_for_input ;;
-            2) _apply_dns_mode doh; pl "Switched to DoH"; pause_for_input ;;
-            3) _apply_dns_mode encrypted; pl "Switched to DoT+DoH"; pause_for_input ;;
-            0) break ;;
-            *) pl "Invalid" ;;
+        pl "  ${G}1${N} 启动/重启服务"
+        pl "  ${C}2${N} 功能设置"
+        pl "  ${R}3${N} 停止服务"
+        pl "  ${Y}4${N} 版本与信息"
+        pl "  ${W}5${N} 切换节点"
+        pl "  ${W}6${N} 测试延迟"
+        pl "  ${W}7${N} 实时监控"
+        pl "  ${W}8${N} 查看日志"
+        pl "  ${W}9${N} 清理内存"
+        pl "  ${W}10${N} 网络测试"
+        pl "  ${W}11${N} 面板地址"
+        pl "  ${W}12${N} 进程资源"
+        pl "  ${W}13${N} 网速测试"
+        pl "  ${W}14${N} 活跃连接"
+        pl "  ${W}15${N} 节点管理"
+        pl "  ${W}16${N} 一键诊断"
+        pl "  ${W}17${N} 系统信息"
+        pl "  ${W}18${N} NSS加速状态"
+        pl "  ${W}19${N} 备份与回滚"
+        pl "  ${W}20${N} 高级调优 (缓冲区/CPU/conntrack/MTU)"
+        pl "  ${W}21${N} 配置管理 (热改/TUN/DNS/Profile)"
+        pl "  ${W}22${N} API查询 (规则/流向/连接/订阅)"
+        pl "  ${W}23${N} clash-rs核心配置 (API/UI/GeoIP/interface)"
+pl "  ${W}24${N} 订阅管理 (cc sub)"
+        line
+        pl "  ${W}0${N} 退出脚本"
+        line
+        printf "  请输入对应数字 > "
+        read choice
+
+        case $choice in
+            1) do_restart; sleep 1 ;;
+            2) show_settings ;;
+            3) do_stop; sleep 1 ;;
+            4) show_version; pause_for_input ;;
+            5) do_switch; pause_for_input ;;
+            6)
+                # 测试延迟: 子菜单选择 PROXY/AUTO 组
+                printf "  ${Y}测试哪个组? [1]PROXY [2]AUTO (回车=PROXY): ${N}"
+                read tgrp
+                case "$tgrp" in
+                    2) do_test --auto ;;
+                    *) do_test ;;
+                esac
+                pause_for_input ;;
+            7) do_monitor ;;
+            8) do_log; pause_for_input ;;
+            9) do_flush; pause_for_input ;;
+            10) do_nettest; pause_for_input ;;
+            11)
+                host=$(ip a 2>/dev/null | grep -w 'inet' | grep 'global' | grep -E ' 1(92|0|72)\.' | sed 's/.*inet.//g' | sed 's/\/[0-9].*$//g' | head -n 1)
+                [ -z "$host" ] && host="192.168.10.1"
+                pl "${G}  面板地址: http://${host}:9090/ui${N}"
+                pl "  API密钥: clashrs2026"
+                pl "  在线面板: https://d.metacubex.one"
+                ;;
+            12) do_top; pause_for_input ;;
+            13) do_speed; pause_for_input ;;
+            14) do_conn; pause_for_input ;;
+            15) do_node_menu ;;
+            16) do_doctor; pause_for_input ;;
+            17) do_sysinfo; pause_for_input ;;
+            18) do_nss; pause_for_input ;;
+            19)
+                # 备份与回滚子菜单
+                while true; do
+                    printf "\n"
+                    line
+                    pl "${C}  备份与回滚${N}"
+                    line
+                    pl "  ${W}1${N}. 立即备份当前配置"
+                    pl "  ${W}2${N}. 查看备份列表"
+                    pl "  ${W}3${N}. 从备份恢复"
+                    pl "  ${W}4${N}. 备份二进制"
+                    pl "  ${W}5${N}. 查看二进制备份"
+                    pl "  ${W}6${N}. 从二进制备份恢复"
+                    pl "  ${W}7${N}. 二进制版本详情"
+                    pl "  ${W}0${N}. 返回上级菜单"
+                    printf "\n  请选择: "
+                    read bk_choice
+                    case "$bk_choice" in
+                        1) _backup_create; pause_for_input ;;
+                        2) _backup_list; pause_for_input ;;
+                        3) _backup_restore; pause_for_input ;;
+                        4) _binbak_create; pause_for_input ;;
+                        5) _binbak_list; pause_for_input ;;
+                        6) _binbak_restore; pause_for_input ;;
+                        7) do_binver; pause_for_input ;;
+                        0) break ;;
+                        *) pl "${R}  无效选择${N}" ;;
+                    esac
+                done
+                ;;
+            20) do_tune ;;
+            21)
+                # 配置管理子菜单
+                while true; do
+                    printf "\n"
+                    line
+                    pl "${C}  配置管理 (热修改/子菜单)${N}"
+                    line
+                    pl "  ${W}1${N}. 查看运行时配置 (cc apiconf)"
+                    pl "  ${W}2${N}. 热改字段 (cc patch)"
+                    pl "  ${W}3${N}. TUN配置子菜单"
+                    pl "  ${W}4${N}. DNS配置子菜单"
+                    pl "  ${W}5${N}. Profile持久化子菜单"
+                    pl "  ${W}6${N}. 完整设置菜单 (端口/IPv6/log-level/experimental)"
+                    pl "  ${W}7${N}. clash-rs核心配置 (API/UI/GeoIP/interface)"
+                    pl "  ${W}8${N}. AUTO组配置 (tolerance/interval/强制切换)"
+                    pl "  ${W}0${N}. 返回上级菜单"
+                    printf "\n  请选择: "
+                    read cfg_choice
+                    case "$cfg_choice" in
+                        1) do_apiconf; pause_for_input ;;
+                        2)
+                            printf "  字段名 (如 port/mode/ipv6/allow-lan/log-level): "; read pf
+                            printf "  新值: "; read pv
+                            do_patch "$pf" "$pv"
+                            pause_for_input
+                            ;;
+                        3) do_tun ;;
+                        4) do_dns_conf ;;
+                        5) do_profile ;;
+                        6) show_settings ;;
+                        7) do_clash_conf ;;
+                        8) do_autogroup ;;
+                        0) break ;;
+                        *) pl "${R}  无效选择${N}" ;;
+                    esac
+                done
+                ;;
+            22)
+                # API查询子菜单
+                while true; do
+                    printf "\n"
+                    line
+                    pl "${C}  API查询 (规则/流向/连接/订阅)${N}"
+                    line
+                    pl "  ${W}1${N}. 查看路由规则 (cc rules)"
+                    pl "  ${W}2${N}. 流量流向 TOP (cc flows)"
+                    pl "  ${W}3${N}. 活跃连接 (cc conn)"
+                    pl "  ${W}4${N}. 关闭连接 (cc conns kill)"
+                    pl "  ${W}5${N}. 订阅/规则集管理 (cc provider)"
+                    pl "  ${W}6${N}. DNS解析测试 (cc dns-query)"
+                    pl "  ${W}0${N}. 返回上级菜单"
+                    printf "\n  请选择: "
+                    read api_choice
+                    case "$api_choice" in
+                        1)
+                            printf "  显示条数 (回车=50): "; read rl
+                            do_rules "$rl"
+                            pause_for_input
+                            ;;
+                        2)
+                            printf "  TOP数 (回车=15): "; read fl
+                            do_flows "$fl"
+                            pause_for_input
+                            ;;
+                        3) do_conn; pause_for_input ;;
+                        4)
+                            printf "  连接ID或all: "; read cid
+                            do_conns_kill "$cid"
+                            pause_for_input
+                            ;;
+                        5)
+                            printf "  操作 (list/update, 回车=list): "; read pa_op
+                            if [ "$pa_op" = "update" ]; then
+                                printf "  名称 (或all): "; read pa_name
+                                do_provider update "$pa_name"
+                            else
+                                do_provider list
+                            fi
+                            pause_for_input
+                            ;;
+                        6)
+                            printf "  域名: "; read dn
+                            printf "  类型 (A/AAAA/CNAME/MX, 默认A): "; read dt
+                            [ -z "$dt" ] && dt="A"
+                            do_dns_query "$dn" "$dt"
+                            pause_for_input
+                            ;;
+                        0) break ;;
+                        *) pl "${R}  无效选择${N}" ;;
+                    esac
+                done
+                ;;
+            23) do_clash_conf ;;
+    24) sh /etc/clash-rs/cc.sh sub; pause_for_input ;;
+            0) printf "\n"; exit 0 ;;
+            *) pl "${R}  请输入正确的数字！${N}" ;;
         esac
     done
 }
-
 
 # ============================================================
 # 入口
 # ============================================================
-
-# ============================================================
-# 全量备份/恢复 + lastgood 启动
-# ============================================================
-_full_backup() {
-    local bakdir="/etc/clash-rs/fullbackup"
-    local ts=$(date +%Y%m%d-%H%M%S)
-    local target="$bakdir/$ts"
-    mkdir -p "$target" 2>/dev/null
-    local cnt=0
-    for f in /etc/clash-rs/config.yaml /etc/clash-rs/config.yaml.lastgood /etc/clash-rs/cc.sh /etc/clash-rs/mem_threshold /etc/clash-rs/cn_ip.txt /etc/init.d/clash-rs /usr/bin/clash-watchdog /usr/bin/fix-nodes /usr/bin/fix-tx-queue /usr/bin/safe-ntp /usr/bin/clash-logrotate /usr/bin/clash-wrapper /etc/rc.local /etc/sysctl.conf /etc/crontabs/root; do
-        if [ -f "$f" ]; then
-            local dest="$target$f"
-            mkdir -p "$(dirname "$dest")" 2>/dev/null
-            cp "$f" "$dest" 2>/dev/null && cnt=$((cnt+1))
-        fi
-    done
-    echo "backup_time=$ts config_md5=$(md5sum /etc/clash-rs/config.yaml 2>/dev/null | awk '{print $1}') files=$cnt" > "$target/info.txt"
-    local keep=5
-    local n=$(ls -1d "$bakdir"/*/ 2>/dev/null | wc -l)
-    if [ "$n" -gt "$keep" ]; then
-        ls -1d "$bakdir"/*/ 2>/dev/null | sort | head -$((n-keep)) | while read d; do rm -rf "$d" 2>/dev/null; done
-    fi
-    local sz=$(du -sh "$target" 2>/dev/null | awk '{print $1}')
-    pl "${G}  全量备份完成: $cnt 文件, ${sz:-?}${N}"
-    pl "  目录: $target"
-}
-
-_full_backup_list() {
-    local bakdir="/etc/clash-rs/fullbackup"
-    [ ! -d "$bakdir" ] && { pl "${R}  无全量备份${N}"; return 1; }
-    local files=$(ls -1d "$bakdir"/*/ 2>/dev/null | sort -r)
-    [ -z "$files" ] && { pl "${R}  无全量备份${N}"; return 1; }
-    pl "${C}  全量备份列表 (最新在前)${N}"
-    line
-    local i=0
-    echo "$files" | while read d; do
-        [ -z "$d" ] && continue
-        i=$((i+1))
-        local ts=$(basename "$d")
-        local info="$d/info.txt"
-        local cnt=$(grep files= "$info" 2>/dev/null | awk -F= '{print $2}')
-        local sz=$(du -sh "$d" 2>/dev/null | awk '{print $1}')
-        pl "  ${W}$i${N}. $ts (${cnt:-?}文件, ${sz:-?})"
-    done
-    line
-}
-
-_full_restore() {
-    local target="$1"
-    local bakdir="/etc/clash-rs/fullbackup"
-    if [ -z "$target" ]; then
-        _full_backup_list
-        printf "\n  输入序号恢复 (0=取消): "
-        read fr_choice
-        [ -z "$fr_choice" ] || [ "$fr_choice" = "0" ] && { pl "  取消"; return 0; }
-        local files=$(ls -1d "$bakdir"/*/ 2>/dev/null | sort -r)
-        target=$(echo "$files" | sed -n "${fr_choice}p" | sed 's|/$||')
-        [ -z "$target" ] && { pl "${R}  序号超出范围${N}"; return 1; }
-    fi
-    [ ! -d "$target" ] && { pl "${R}  备份不存在: $target${N}"; return 1; }
-    pl "${Y}  即将从 $(basename $target) 恢复全部文件${N}"
-    pl "  ${Y}当前文件会被覆盖, 确认? (y/N)${N}"
-    printf "  > "
-    read confirm
-    case "$confirm" in y|Y) ;; *) pl "  取消"; return 0 ;; esac
-    local cnt=0
-    for f in etc/clash-rs/config.yaml etc/clash-rs/config.yaml.lastgood etc/clash-rs/cc.sh etc/clash-rs/mem_threshold etc/clash-rs/cn_ip.txt etc/init.d/clash-rs usr/bin/clash-watchdog usr/bin/fix-nodes usr/bin/fix-tx-queue usr/bin/safe-ntp usr/bin/clash-logrotate usr/bin/clash-wrapper etc/rc.local etc/sysctl.conf etc/crontabs/root; do
-        [ -f "$target/$f" ] && cp "$target/$f" "/$f" 2>/dev/null && cnt=$((cnt+1))
-    done
-    chmod 755 /etc/init.d/clash-rs /usr/bin/clash-watchdog /usr/bin/fix-nodes /usr/bin/fix-tx-queue /usr/bin/safe-ntp /usr/bin/clash-logrotate /usr/bin/clash-wrapper /etc/clash-rs/cc.sh /etc/rc.local 2>/dev/null
-    pl "${G}  恢复完成: $cnt 文件${N}"
-    pl "  ${Y}建议重启: cc restart${N}"
-}
-
-_start_lastgood() {
-    local lastgood="/etc/clash-rs/config.yaml.lastgood"
-    [ ! -s "$lastgood" ] && { pl "${R}  无上次成功配置${N}"; return 1; }
-    if diff -q "$CONFIG" "$lastgood" >/dev/null 2>&1; then
-        pl "${G}  当前配置=上次成功配置, 直接启动${N}"
-    else
-        pl "${Y}  当前配置与上次成功配置不同, 将从 lastgood 启动${N}"
-        pl "  当前: $(md5sum $CONFIG 2>/dev/null | awk '{print $1}')"
-        pl "  上次: $(md5sum $lastgood 2>/dev/null | awk '{print $1}')"
-        printf "  确认? (y/N): "
-        read confirm
-        case "$confirm" in y|Y) ;; *) pl "  取消"; return 0 ;; esac
-        cp "$CONFIG" "$CONFIG.before" 2>/dev/null
-        cp "$lastgood" "$CONFIG" 2>/dev/null
-    fi
-    pl "${C}  从上次成功配置启动...${N}"
-    /etc/init.d/clash-rs restart 2>&1 | tail -3
-    sleep 3
-    if is_running; then
-        pl "${G}  启动成功 (PID=$(get_pid))${N}"
-        pl "  节点: $(get_proxy_now)"
-        pl "  内存: $(get_rss)MB"
-    else
-        pl "${R}  启动失败, 恢复原配置${N}"
-        cp "$CONFIG.before" "$CONFIG" 2>/dev/null
-        /etc/init.d/clash-rs restart 2>&1 | tail -3
-    fi
-}
-
-
-# ============================================================
-# 强制完整备份 (cc fullbackup-all) - 包含二进制和mmdb
-# ============================================================
-_full_backup_all() {
-    local bakdir="/etc/clash-rs/fullbackup"
-    local ts=$(date +%Y%m%d-%H%M%S)
-    local target="$bakdir/$ts"
-    mkdir -p "$target" 2>/dev/null
-
-    pl "${R}  ========================================${N}"
-    pl "${R}  警告: 强制完整备份${N}"
-    pl "${R}  ========================================${N}"
-    pl "${Y}  此操作会备份以下大文件:${N}"
-    pl "    - clash-rs 二进制 (15.6M)"
-    pl "    - country.mmdb (8.8M)"
-    pl "    - 所有脚本+配置 (~476K)"
-    pl "${Y}  总大小约 25M, 闪存仅 71M${N}"
-    pl "${Y}  频繁操作会减少闪存寿命!${N}"
-    pl "${Y}  仅在核心更新/重大修改后使用${N}"
-    pl ""
-    printf "${Y}  确认强制完整备份? (y/N): ${N}"
-    read confirm
-    case "$confirm" in
-        y|Y) ;;
-        *) pl "  取消"; return 0 ;;
-    esac
-
-    local cnt=0
-    for f in /etc/clash-rs/config.yaml /etc/clash-rs/config.yaml.lastgood /etc/clash-rs/cc.sh /etc/clash-rs/clash-rs /etc/clash-rs/mem_threshold /etc/clash-rs/country.mmdb /etc/clash-rs/cn_ip.txt /etc/init.d/clash-rs /usr/bin/clash-watchdog /usr/bin/fix-nodes /usr/bin/fix-tx-queue /usr/bin/safe-ntp /usr/bin/clash-logrotate /usr/bin/clash-wrapper /etc/rc.local /etc/sysctl.conf /etc/crontabs/root; do
-        if [ -f "$f" ]; then
-            local dest="$target$f"
-            mkdir -p "$(dirname "$dest")" 2>/dev/null
-            cp "$f" "$dest" 2>/dev/null && cnt=$((cnt+1))
-        fi
-    done
-    echo "backup_time=$ts config_md5=$(md5sum /etc/clash-rs/config.yaml 2>/dev/null | awk '{print $1}') files=$cnt type=full" > "$target/info.txt"
-    local keep=2
-    local n=$(ls -1d "$bakdir"/*/ 2>/dev/null | wc -l)
-    if [ "$n" -gt "$keep" ]; then
-        ls -1d "$bakdir"/*/ 2>/dev/null | sort | head -$((n-keep)) | while read d; do rm -rf "$d" 2>/dev/null; done
-    fi
-    local sz=$(du -sh "$target" 2>/dev/null | awk '{print $1}')
-    local avail=$(df -h / | tail -1 | awk '{print $4}')
-    pl "${G}  完整备份完成: $cnt 文件, ${sz:-?}${N}"
-    pl "  目录: $target"
-    pl "  剩余空间: $avail"
-}
-
-
-
-# ============================================================
-# 订阅管理 (cc sub)
-# ============================================================
-_subfile='/etc/clash-rs/subscriptions.list'
-
-_sub_menu() {
-    touch "$_subfile" 2>/dev/null
-    while true; do
-        local cnt=$(wc -l < "$_subfile" 2>/dev/null)
-        printf '\n'
-        line
-        pl "${C}  订阅管理${N}  ${Y}已保存 $cnt 个订阅${N}"
-        line
-        pl "  ${W}1${N}. 添加订阅链接"
-        pl "  ${W}2${N}. 列出订阅"
-        pl "  ${W}3${N}. 更新订阅"
-        pl "  ${W}4${N}. 删除订阅"
-        pl "  ${W}5${N}. 导入单节点"
-        pl "  ${W}6${N}. 自动更新设置"
-        pl "  ${W}0${N}. 返回"
-        line
-        printf '\n  选择: '
-        read sm_choice
-        case "$sm_choice" in
-            1) _sub_add ;;
-            2) _sub_list ;;
-            3) _sub_update ;;
-            4) _sub_del ;;
-            5) _sub_single_input ;;
-            6) _sub_auto_update ;;
-            0) break ;;
-            *) pl "${R}  无效${N}" ;;
-        esac
-    done
-}
-
-_sub_add() {
-    printf "  ${Y}订阅链接: ${N}"
-    read url
-    [ -z "$url" ] && { pl "  取消"; return; }
-    if grep -qF "$url" "$_subfile" 2>/dev/null; then
-        pl "${R}  已存在${N}"
-        return
-    fi
-    echo "$url" >> "$_subfile"
-    pl "${G}  已添加${N}"
-    printf "  ${Y}立即下载? (y/N): ${N}"
-    read confirm
-    case "$confirm" in y|Y) _sub_update_one "$url" ;; esac
-}
-
-_sub_list() {
-    [ ! -s "$_subfile" ] && { pl "${R}  无订阅${N}"; return; }
-    pl "${C}  订阅列表${N}"
-    line
-    local i=0
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        i=$((i+1))
-        local short=$(echo "$line" | cut -c1-60)
-        pl "  ${W}$i${N}. ${short}..."
-    done < "$_subfile"
-    line
-}
-
-_sub_update() {
-    [ ! -s "$_subfile" ] && { pl "${R}  无订阅${N}"; return; }
-
-    # 列出所有订阅，让用户选择更新哪个
-    local cnt=$(grep -cE '.' "$_subfile" 2>/dev/null)
-    [ "$cnt" -eq 0 ] && { pl "${R}  无订阅${N}"; return; }
-
-    _sub_list
-    echo ""
-    printf "  选择更新 (1-${cnt}, 回车=全部, 0=取消): "
-    read sel
-    [ "$sel" = "0" ] && return
-
-    local total=0
-    local tmpnodes='/tmp/sub_all_nodes.txt'
-    > "$tmpnodes"
-
-    if [ -n "$sel" ] && [ "$sel" -ge 1 ] 2>/dev/null && [ "$sel" -le "$cnt" ]; then
-        # 更新单个订阅（用 sed 行号取指定行）
-        local url=$(sed -n "${sel}p" "$_subfile")
-        [ -z "$url" ] && { pl "${R}  无效选择${N}"; rm -f "$tmpnodes"; return; }
-        pl "${C}  更新第 ${sel} 个订阅...${N}"
-        local nodes=$(_sub_download_one "$url")
-        if [ -n "$nodes" ]; then
-            echo "$nodes" >> "$tmpnodes"
-            local n=$(echo "$nodes" | grep -c 'name:')
-            total=$n
-            pl "  ${G}OK${N} ($n 节点)"
-        else
-            pl "  ${R}FAIL${N} $(echo "$url" | cut -c1-50)..."
-            rm -f "$tmpnodes"
-            return
-        fi
-    else
-        # 更新全部
-        pl "${C}  更新所有订阅...${N}"
-        while IFS= read -r url; do
-            [ -z "$url" ] && continue
-            local nodes=$(_sub_download_one "$url")
-            if [ -n "$nodes" ]; then
-                echo "$nodes" >> "$tmpnodes"
-                local n=$(echo "$nodes" | grep -c 'name:')
-                total=$((total+n))
-                pl "  ${G}OK${N} $(echo "$url" | cut -c1-50)... (${n}节点)"
-            else
-                pl "  ${R}FAIL${N} $(echo "$url" | cut -c1-50)..."
-            fi
-        done < "$_subfile"
-    fi
-
-    if [ "$total" -eq 0 ]; then
-        pl "${R}  无有效节点${N}"
-        rm -f "$tmpnodes"
-        return
-    fi
-    pl "${Y}  共 $total 个节点, 合并? (y/N)${N}"
-    printf '  > '
-    read confirm
-    case "$confirm" in y|Y) ;; *) pl "  取消"; rm -f "$tmpnodes"; return ;; esac
-    cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
-    awk -v nodes="$(cat $tmpnodes)" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-    if _reload_config; then
-        pl "${G}  更新成功, $total 个节点${N}"
-    else
-        pl "${R}  失败, 恢复${N}"
-        cp "$CONFIG.bak.sub."* "$CONFIG" 2>/dev/null
-    fi
-    rm -f "$tmpnodes"
-}
-
-_sub_update_one() {
-    local url="$1"
-    local nodes=$(_sub_download_one "$url")
-    if [ -n "$nodes" ]; then
-        local n=$(echo "$nodes" | grep -c 'name:')
-        pl "${G}  下载成功: $n 个节点${N}"
-        pl "${Y}  合并? (y/N)${N}"
-        printf '  > '
-        read confirm
-        case "$confirm" in y|Y) ;; *) return ;; esac
-        cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
-        awk -v nodes="$nodes" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-        _reload_config && pl "${G}  OK${N}" || pl "${R}  FAIL${N}"
-    else
-        pl "${R}  下载失败${N}"
-    fi
-}
-
-_sub_download_one() {
-    local url="$1"
-    local tmp='/tmp/sub_dl.txt'
-    local host=$(echo "$url" | sed -n 's|https://\([^/:]*\).*|\1|p')
-    local resolve_opts=""
-    local proxy_opts=""
-
-    # 绕过 fake-ip: 先用直连 DNS 解析域名，再用 --resolve 下载
-    if [ -n "$host" ]; then
-        # 尝试 223.5.5.5（阿里 DNS，对国外 CDN 兼容性好）
-        local real_ip=$(nslookup "$host" 223.5.5.5 2>/dev/null | grep 'Address' | grep -v '223.5' | grep -v '127.0.0' | head -1 | awk '{print $NF}')
-        if [ -z "$real_ip" ] || [ "$real_ip" = "198.18.0.24" ]; then
-            # 再试 114.114.114.114
-            real_ip=$(nslookup "$host" 114.114.114.114 2>/dev/null | grep 'Address' | grep -v '114.114' | grep -v '127.0.0' | head -1 | awk '{print $NF}')
-        fi
-        if [ -n "$real_ip" ] && [ "$real_ip" != "198.18.0.24" ]; then
-            resolve_opts="--resolve ${host}:443:${real_ip}"
-        else
-            # 直连 DNS 解析失败，走代理下载（订阅域名多在境外 CDN）
-            proxy_opts="-x http://127.0.0.1:7890"
-        fi
-    fi
-
-    curl -s -L --connect-timeout 15 --max-time 30 $proxy_opts $resolve_opts -o "$tmp" "$url" 2>/dev/null
-    [ ! -s "$tmp" ] && { echo ''; return; }
-    local first=$(head -1 "$tmp")
-    if echo "$first" | grep -qE 'proxies:|proxy-groups:|mixed-port:'; then
-        sed -n '/^proxies:/,/^proxy-groups:/p' "$tmp" | grep 'name:'
-    else
-        local decoded='/tmp/sub_dec.txt'
-        base64 -d "$tmp" > "$decoded" 2>/dev/null || cp "$tmp" "$decoded"
-        while IFS= read -r line; do
-            case "$line" in
-                ss://*) _parse_ss "$line" ;;
-                trojan://*) _parse_trojan "$line" ;;
-                anytls://*) _parse_anytls "$line" ;;
-            esac
-        done < "$decoded"
-        rm -f "$decoded"
-    fi
-    rm -f "$tmp"
-}
-
-_parse_ss() {
-    local line="$1"
-    line="${line#ss://}"
-    local name=$(echo "$line" | sed -n 's/.*#//p' | tr -d '\r')
-    local rest="${line%%#*}"
-    local decoded=$(echo -n "$rest" | base64 -d 2>/dev/null || echo "$rest")
-    local method=$(echo "$decoded" | sed -n 's/^\([^:]*\):.*/\1/p')
-    local passwd=$(echo "$decoded" | sed -n 's/^[^:]*:\([^@]*\)@.*/\1/p')
-    local server_port=$(echo "$decoded" | sed -n 's/.*@//p')
-    local server=$(echo "$server_port" | sed -n 's/:\([0-9]*\)$//p')
-    local port=$(echo "$server_port" | sed -n 's/.*://p')
-    [ -z "$method" ] && method="2022-blake3-aes-128-gcm"
-    [ -z "$name" ] && name="SS-$port"
-    echo "  - {name: \"$name\", server: $server, port: $port, type: ss, cipher: $method, password: \"$passwd\", udp: true}"
-}
-
-_parse_trojan() {
-    local line="$1"
-    line="${line#trojan://}"
-    local name=$(echo "$line" | sed -n 's/.*#//p' | tr -d '\r')
-    local rest="${line%%#*}"
-    local passwd=$(echo "$rest" | sed -n 's/^\([^@]*\)@.*/\1/p')
-    local server_port=$(echo "$rest" | sed -n 's/.*@//p' | sed 's/?.*//')
-    local server=$(echo "$server_port" | sed -n 's/:\([0-9]*\)$//p')
-    local port=$(echo "$server_port" | sed -n 's/.*://p')
-    [ -z "$name" ] && name="Trojan-$port"
-    echo "  - {name: \"$name\", server: $server, port: $port, type: trojan, password: \"$passwd\", sni: www.baidu.com, skip-cert-verify: true, udp: true}"
-}
-
-_parse_anytls() {
-    local line="$1"
-    line="${line#anytls://}"
-    local name=$(echo "$line" | sed -n 's/.*#//p' | tr -d '\r')
-    local rest="${line%%#*}"
-    local passwd=$(echo "$rest" | sed -n 's/^\([^@]*\)@.*/\1/p')
-    local server_port=$(echo "$rest" | sed -n 's/.*@//p' | sed 's/?.*//')
-    local server=$(echo "$server_port" | sed -n 's/:\([0-9]*\)$//p')
-    local port=$(echo "$server_port" | sed -n 's/.*://p')
-    [ -z "$name" ] && name="AnyTLS-$port"
-    echo "  - {name: \"$name\", server: $server, port: $port, type: anytls, password: \"$passwd\", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}"
-}
-
-_sub_single_input() {
-    printf "  ${Y}节点链接: ${N}"
-    read url
-    [ -z "$url" ] && return
-    _sub_single "$url"
-}
-
-_sub_single() {
-    local url="$1"
-    local line=""
-    case "$url" in
-        ss://*) line=$(_parse_ss "$url") ;;
-        trojan://*) line=$(_parse_trojan "$url") ;;
-        anytls://*) line=$(_parse_anytls "$url") ;;
-        *) pl "${R}  不支持${N}"; return ;;
-    esac
-    [ -z "$line" ] && { pl "${R}  解析失败${N}"; return; }
-    pl "  $line"
-    pl "${Y}  添加? (y/N)${N}"
-    printf '  > '
-    read confirm
-    case "$confirm" in y|Y) ;; *) return ;; esac
-    cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
-    awk -v nodes="$line" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
-    _reload_config && pl "${G}  已添加${N}" || { pl "${R}  FAIL${N}"; cp "$CONFIG.bak.sub."* "$CONFIG" 2>/dev/null; }
-}
-
-_sub_del() {
-    [ ! -s "$_subfile" ] && { pl "${R}  无订阅${N}"; return; }
-    _sub_list
-    printf '  输入序号删除 (0=取消): '
-    read choice
-    [ "$choice" = "0" ] || [ -z "$choice" ] && return
-    sed -i "${choice}d" "$_subfile" 2>/dev/null
-    pl "${G}  已删除${N}"
-}
-
-_do_sub_import() {
-    if [ -n "$1" ]; then
-        case "$1" in
-            http://*|https://*) _sub_update_one "$1" ;;
-            ss://*|trojan://*|anytls://*) _sub_single "$1" ;;
-            *) _sub_menu ;;
-        esac
-    else
-        _sub_menu
-    fi
-}
-
-
-
-# ============================================================
-# 订阅自动更新 (cc sub-auto)
-# ============================================================
-_sub_auto_update() {
-    local interval="${1:-}"
-    local subfile='/etc/clash-rs/subscriptions.list'
-
-    # 显示当前设置
-    _show_sub_auto() {
-        local crontab_out=$(crontab -l 2>/dev/null)
-        local sub_cron=$(echo "$crontab_out" | grep 'sub-update' | head -1)
-        if [ -n "$sub_cron" ]; then
-            local sched=$(echo "$sub_cron" | awk '{print $1}')
-            echo "当前: $sched (每 $interval 小时)"
-        else
-            echo "当前: 未启用自动更新"
-        fi
-    }
-
-    if [ -n "$interval" ]; then
-        # 直接设置
-        if [ "$interval" = "0" ] || [ "$interval" = "off" ]; then
-            # 关闭自动更新
-            _crontab_out=$(crontab -l 2>/dev/null)
-            [ -n "$_crontab_out" ] && echo "$_crontab_out" | grep -v 'sub-update' | crontab -
-            pl "${G}已关闭订阅自动更新${N}"
-            return
-        fi
-        # 设置间隔（小时）
-        local sched="*/$interval * * *"
-        # 如果是 24 的因数，用每天
-        if [ "$interval" = "24" ]; then sched="0 0 * * *"
-        elif [ "$interval" = "12" ]; then sched="0 */12 * * *"
-        elif [ "$interval" = "6" ]; then sched="0 */6 * * *"
-        elif [ "$interval" = "4" ]; then sched="0 */4 * * *"
-        elif [ "$interval" = "2" ]; then sched="0 */2 * * *"
-        elif [ "$interval" = "1" ]; then sched="0 * * * *"
-        fi
-        # 先删旧的
-        _crontab_out=$(crontab -l 2>/dev/null)
-        [ -n "$_crontab_out" ] && echo "$_crontab_out" | grep -v 'sub-update' | crontab -
-        # 加新的
-        echo "$sched /etc/clash-rs/cc.sh sub-update >/dev/null 2>&1" | crontab -
-        pl "${G}已设置: 每 $interval 小时自动更新订阅${N}"
-        return
-    fi
-
-    # 交互菜单
-    while true; do
-        printf '\n'
-        line
-        pl "${C}  订阅自动更新${N}"
-        line
-        _show_sub_auto
-        pl "  ${W}1${N}. 每 1 小时"
-        pl "  ${W}2${N}. 每 2 小时"
-        pl "  ${W}3${N}. 每 4 小时"
-        pl "  ${W}4${N}. 每 6 小时"
-        pl "  ${W}5${N}. 每 12 小时"
-        pl "  ${W}6${N}. 每天 0:00"
-        pl "  ${W}0${N}. 关闭自动更新"
-        line
-        printf '\n  选择: '
-        read sm_choice
-        case "$sm_choice" in
-            1) _sub_auto_update 1; break ;;
-            2) _sub_auto_update 2; break ;;
-            3) _sub_auto_update 4; break ;;
-            4) _sub_auto_update 6; break ;;
-            5) _sub_auto_update 12; break ;;
-            6) _sub_auto_update 24; break ;;
-            0) _sub_auto_update off; break ;;
-            *) pl "${R}  无效${N}" ;;
-        esac
-    done
-}
-
-_sub_update_all() {
-    local subfile='/etc/clash-rs/subscriptions.list'
-    [ ! -s "$subfile" ] && { pl "${R}  无订阅${N}"; return 1; }
-    pl "${C}  更新所有订阅...${N}"
-    local total=0
-    local allnodes='/tmp/sub_all_nodes.txt'
-    > "$allnodes"
-    while IFS= read -r url; do
-        [ -z "$url" ] && continue
-        local nodes=$(_sub_download_one "$url")
-        if [ -n "$nodes" ]; then
-            echo "$nodes" >> "$allnodes"
-            local n=$(echo "$nodes" | grep -c 'name:')
-            total=$((total+n))
-            pl "  ${G}OK${N} $(echo "$url" | cut -c1-50)... (${n}节点)"
-        else
-            pl "  ${R}FAIL${N} $(echo "$url" | cut -c1-50)..."
-        fi
-    done < "$subfile"
-    if [ "$total" -eq 0 ]; then
-        pl "${R}  无有效节点${N}"
-        rm -f "$allnodes"
-        return 1
-    fi
-    pl "${Y}  共 $total 个节点, 合并到 config...${N}"
-
-    # 备份
-    cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
-
-    # 解析节点（URL解码+过滤）
-    local node_names=""
-    local real_nodes=""
-    while IFS= read -r line; do
-        echo "$line" | grep -qE 'name:.*(剩余|到期|重置|套餐|%E5%89%A9|%E5%88%B0|%E9%87%8D|%E5%A5%97)' && continue
-        local name=$(echo "$line" | sed -n 's/.*name: "\([^"]*\)".*/\1/p')
-        [ -z "$name" ] && continue
-        local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
-        [ -z "$decoded" ] && decoded="$name"
-        echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
-        local new_line=$(echo "$line" | sed "s/name: \"$name\"/name: \"$decoded\"/" 2>/dev/null)
-        [ -z "$new_line" ] && new_line="$line"
-        node_names="$node_names
-$decoded"
-        real_nodes="$real_nodes
-$new_line"
-    done < "$allnodes"
-
-    # 从旧 config 提取 header 和 rules
-    local header=$(sed -n '1,/^proxies:/p' "$CONFIG" | head -n -1)
-    local rules=$(sed -n '/^rules:/,$p' "$CONFIG")
-
-    # 生成新 config
-    {
-        echo "$header"
-        echo ""
-        echo "proxies:"
-        echo "$real_nodes" | grep -v '^$'
-        echo ""
-        echo "proxy-groups:"
-        echo "  - name: PROXY"
-        echo "    type: select"
-        echo "    proxies:"
-        echo "      - AUTO"
-        echo "      - DIRECT"
-        echo "$node_names" | grep -v '^$' | while IFS= read -r n; do
-            echo "      - \"$n\""
-        done
-        echo ""
-        echo "  - name: AUTO"
-        echo "    type: url-test"
-        echo "    url: http://cp.cloudflare.com/generate_204"
-        echo "    interval: 600"
-        echo "    tolerance: 50"
-        echo "    timeout: 5"
-        echo "    proxies:"
-        echo "$node_names" | grep -v '^$' | while IFS= read -r n; do
-            echo "      - \"$n\""
-        done
-        echo ""
-        echo "$rules"
-    } > "$CONFIG.tmp"
-
-    # 先 mv 再 reload（避免 reload 旧 config）
-    mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null
-    pl "${G}  更新成功: $total 个节点, 重启 clash-rs 生效${N}"
-    /etc/init.d/clash-rs restart >/dev/null 2>&1 &
-    rm -f "$allnodes"
-}
-
 
 case "$1" in
     start)    do_start ;;
@@ -5384,14 +4969,6 @@ case "$1" in
     flows)    do_flows "$2" ;;
     provider) do_provider "$2" "$3" ;;
     tun)      do_tun ;;
-    dns-mode) do_dns_mode "$2" ;;
-    fullbackup) _full_backup ;;
-    fullbackup-all) _full_backup_all ;;
-    fullrestore) _full_restore "$2" ;;
-    start-lastgood) _start_lastgood ;;
-    sub) _do_sub_import "$1" ;;
-    sub-update) _sub_update_all ;;
-    sub-auto) _sub_auto_update "$2" ;;
     dns)
         # cc dns 进入DNS子菜单; cc dns-query <domain> 是DNS测试
         if [ -z "$2" ]; then do_dns_conf
@@ -5401,8 +4978,8 @@ case "$1" in
         ;;
     profile)  do_profile ;;
     clashconf) do_clash_conf ;;
-    tolerance) /usr/bin/tolerance-config.sh $2 ;;
     autogroup) do_autogroup ;;
+    sub) sh /etc/clash-rs/cc.sh sub ;;
     version|--version|-v) show_version ;;
     help|--help|-h)
         pl "${W}cc - clash-rs 管理命令 (v${CC_VERSION})${N}"
