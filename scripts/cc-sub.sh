@@ -5014,14 +5014,22 @@ _sub_update() {
     printf '  > '
     read confirm
     case "$confirm" in y|Y) ;; *) pl "  取消"; rm -f "$tmpnodes"; return ;; esac
-    cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
-    awk -v nodes="$(cat $tmpnodes)" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+    local bakfile="$CONFIG.bak.sub.$(date +%s)"
+    cp "$CONFIG" "$bakfile" 2>/dev/null
+    awk -v nodes="$(cat $tmpnodes)" '/^proxy-groups:/ && !done {print nodes; done=1} {print}' "$CONFIG" > "$CONFIG.tmp" 2>/dev/null
+    if [ $? -ne 0 ] || [ ! -s "$CONFIG.tmp" ]; then
+        pl "${R}  配置合并失败 (awk 处理出错), 已恢复备份${N}"
+        cp "$bakfile" "$CONFIG" 2>/dev/null
+        rm -f "$tmpnodes" "$CONFIG.tmp"
+        return
+    fi
+    mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null
     if _reload_config; then
         local ts=$(date '+%H:%M:%S')
         pl "${G}  [${ts}] 更新成功, $total 个节点已替换到配置中${N}"
     else
-        pl "${R}  失败, 已恢复备份${N}"
-        cp "$CONFIG.bak.sub."* "$CONFIG" 2>/dev/null
+        pl "${R}  重启 clash-rs 失败, 已恢复备份 (可用 cc restart 手动重试)${N}"
+        cp "$bakfile" "$CONFIG" 2>/dev/null
     fi
     rm -f "$tmpnodes"
 }
@@ -5240,6 +5248,7 @@ _sub_auto_update() {
         pl "  ${W}4${N}. 每 6 小时"
         pl "  ${W}5${N}. 每 12 小时"
         pl "  ${W}6${N}. 每天 0:00"
+        pl "  ${W}7${N}. 自定义 (输入任意小时数)"
         pl "  ${W}0${N}. 关闭自动更新"
         line
         printf '\n  选择: '
@@ -5251,6 +5260,12 @@ _sub_auto_update() {
             4) _sub_auto_update 6; break ;;
             5) _sub_auto_update 12; break ;;
             6) _sub_auto_update 24; break ;;
+            7)
+                printf "  输入间隔小时数 (如 3=每3小时, 8=每8小时): "
+                read custom_h
+                [ -n "$custom_h" ] && [ "$custom_h" -ge 1 ] 2>/dev/null && _sub_auto_update $custom_h; break
+                pl "${R}  无效${N}"
+                ;;
             0) _sub_auto_update off; break ;;
             *) pl "${R}  无效${N}" ;;
         esac

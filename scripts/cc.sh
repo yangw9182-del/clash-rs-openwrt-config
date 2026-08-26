@@ -4762,6 +4762,18 @@ show_menu() {
         if is_running; then
             pl "  当前${mem_info}，已${time_info}"
             pl "  当前${node_info}"
+            # 路由器开机时间
+            if [ -f /proc/uptime ]; then
+                local sec=$(cat /proc/uptime | awk '{print int($1)}')
+                local day=$((sec / 86400))
+                local hour=$(( (sec % 86400) / 3600 ))
+                local min=$(( (sec % 3600) / 60 ))
+                local router_up=""
+                [ "$day" -gt 0 ] && router_up="${day}天"
+                router_up="${router_up}${hour}时${min}分"
+                local boot_time=$(date -d "@$(($(date +%s) - sec))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+                pl "  路由器: ${router_up} (开机: ${boot_time})"
+            fi
             NH_VAL=$(cat $NODE_HEALTH_FILE 2>/dev/null)
             if [ "$NH_VAL" = "1" ]; then
                 pl "  节点健康检查:${G}开${N} (每60秒自动切换故障节点)"
