@@ -1100,28 +1100,22 @@ dns:
       - 240.0.0.0/4
 
 proxies:
-  - {name: "HK-1", server: <REPLACE-SERVER>, port: 8443, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "HK-2", server: <REPLACE-SERVER>, port: 36812, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "HK-3", server: <REPLACE-SERVER>, port: 34587, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "HK-4", server: <REPLACE-SERVER>, port: 60012, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "HK-5", server: <REPLACE-SERVER>, port: 1002, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "HK-6", server: <REPLACE-SERVER>, port: 36822, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "JP-1", server: <REPLACE-SERVER>, port: 1047, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "JP-2", server: <REPLACE-SERVER>, port: 1007, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "JP-3", server: <REPLACE-SERVER>, port: 40005, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "JP-4", server: <REPLACE-SERVER>, port: 34588, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "JP-5", server: <REPLACE-SERVER>, port: 1048, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "JP-6", server: <REPLACE-SERVER>, port: 34571, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "JP-7", server: <REPLACE-SERVER>, port: 13650, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "SG-1", server: <REPLACE-SERVER>, port: 1049, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "SG-2", server: <REPLACE-SERVER>, port: 31248, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "SG-3", server: <REPLACE-SERVER>, port: 34579, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "SG-4", server: <REPLACE-SERVER>, port: 1015, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "SG-5", server: <REPLACE-SERVER>, port: 60612, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "US-1", server: <REPLACE-SERVER>, port: 1050, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "US-2", server: <REPLACE-SERVER>, port: 40006, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "US-3", server: <REPLACE-SERVER>, port: 1016, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
-  - {name: "US-4", server: <REPLACE-SERVER>, port: 14706, type: anytls, password: "<REPLACE>", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}
+proxies:
+  # ============================================
+  # 节点配置区：此处填写你自己的节点
+  # 支持: anytls / ss / trojan / vmess / vless 等
+  #
+  # 推荐: 用 `cc node add <订阅链接>` 或
+  #       `cc sub-update` 从机场自动拉取节点
+  #       （无需手动填写下面的条目）
+  #
+  # 手动添加单个节点示例:
+  # - {name: "HK-1", server: 1.2.3.4, port: 8443, type: anytls,
+  #    password: "your-password", client-fingerprint: chrome,
+  #    sni: www.baidu.com, skip-cert-verify: true, udp: true}
+  # - {name: "SS-1", server: 1.2.3.5, port: 8388, type: ss,
+  #    cipher: aes-128-gcm, password: "your-password", udp: true}
+  # ============================================
 
 proxy-groups:
   - name: PROXY

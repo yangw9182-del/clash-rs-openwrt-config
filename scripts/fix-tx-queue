@@ -1,0 +1,18 @@
+#!/bin/sh
+# fix wifi tx_queue_len
+for iface in ath0 ath1; do
+    val=$(cat /sys/class/net/$iface/tx_queue_len 2>/dev/null)
+    if [ "$val" = "0" ] || [ -z "$val" ]; then
+        ip link set dev $iface txqueuelen 1000 2>/dev/null
+    fi
+done
+
+# RPS 检查（WiFi 队列可能在 rps-tune.sh 后才创建）
+for iface in ath0 ath1; do
+    for q in 0 1 2 3; do
+        _rps=$(cat /sys/class/net/$iface/queues/rx-$q/rps_cpus 2>/dev/null)
+        if [ -n "$_rps" ] && [ "$_rps" != "3" ]; then
+            echo 3 > /sys/class/net/$iface/queues/rx-$q/rps_cpus 2>/dev/null
+        fi
+    done
+done

@@ -1,0 +1,13 @@
+#!/bin/sh
+# 安全的NTP同步 (带超时保护, 防止卡死)
+ntpclient -h ntp.aliyun.com -s 2>/dev/null &
+PID1=$!
+sleep 3
+kill $PID1 2>/dev/null
+wait $PID1 2>/dev/null
+
+ntpclient -h cn.pool.ntp.org -s 2>/dev/null &
+PID2=$!
+sleep 3
+kill $PID2 2>/dev/null
+wait $PID2 2>/dev/null

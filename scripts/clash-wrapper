@@ -1,0 +1,45 @@
+#!/bin/sh
+# clash-rs wrapper: 捕获退出信号
+CLASH_BIN=/etc/clash-rs/clash-rs
+CONFIG=/etc/clash-rs/config.yaml
+WATCHDOG=/usr/bin/clash-watchdog
+LOG=/var/log/clash-exit.log
+
+# 启动日志
+echo "$(date): starting clash-rs (PID=$$)" >> $LOG
+
+# 运行 clash-rs 并捕获退出信号
+RUST_BACKTRACE=1 $CLASH_BIN -f $CONFIG >> /var/log/clash-rs.log 2>&1
+EXIT_CODE=$?
+echo "$(date): clash-rs exited with code=$EXIT_CODE (PID=$$)" >> $LOG
+
+# 记录 SIGTERM(143) 或 SIGKILL(137) 等
+case $EXIT_CODE in
+    143) echo "$(date): EXIT=143 (SIGTERM)" >> $LOG ;;
+    137) echo "$(date): EXIT=137 (SIGKILL/oom)" >> $LOG ;;
+    139) echo "$(date): EXIT=139 (SIGSEGV)" >> $LOG ;;
+    134) echo "$(date): EXIT=134 (SIGABRT/panic)" >> $LOG ;;
+    *) echo "$(date): EXIT=$EXIT_CODE" >> $LOG ;;
+esac
+
+# 紧急: 立即移除透明代理 REDIRECT 规则，让流量直连
+# 不等 watchdog 检测，clash-rs 一退出就移除
+iptables -t nat -D clash_reroute -p tcp -j REDIRECT --to-ports 7892 2>/dev/null
+iptables -t nat -D clash_dns -p udp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
+iptables -t nat -D clash_dns -p tcp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
+echo "$(date): emergency: REDIRECT rules removed (traffic direct)" >> $LOG
+
+# 恢复 DNS 直连
+uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
+uci -q add_list dhcp.@dnsmasq[0].server='119.29.29.29' 2>/dev/null
+uci -q add_list dhcp.@dnsmasq[0].server='223.5.5.5' 2>/dev/null
+uci -q commit dhcp 2>/dev/null
+echo "nameserver 119.29.29.29" > /tmp/resolv.conf 2>/dev/null
+echo "nameserver 223.5.5.5" >> /tmp/resolv.conf 2>/dev/null
+killall -9 dnsmasq 2>/dev/null
+/etc/init.d/dnsmasq start >/dev/null 2>&1 &
+echo "$(date): DNS restored to direct (119/223)" >> $LOG
+
+# 通知 watchdog（watchdog 会重启 clash-rs 并恢复 REDIRECT）
+[ -x "$WATCHDOG" ] && $WATCHDOG --check-clash
+exit $EXIT_CODE

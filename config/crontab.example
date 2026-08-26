@@ -1,3 +1,8 @@
+# ============================================
+# clash-rs OpenWrt 自动任务 crontab 示例
+# 用法: crontab -l > /tmp/ct; cat 本文件 >> /tmp/ct; crontab /tmp/ct
+# ============================================
+# 日志轮转(每10分钟, 上限100KB)
 */10 * * * * /usr/bin/clash-logrotate 2>/dev/null
 */5 * * * * /usr/bin/fix-tx-queue
 */10 * * * * /usr/bin/dns-guard 2>/dev/null
