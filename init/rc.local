@@ -1,0 +1,14 @@
+#!/bin/sh
+# sysctl params unified in /etc/sysctl.conf
+# RPS/XPS + ip6tables rules in init.d/clash-rs start()
+/etc/clash-rs/rps-tune.sh >/dev/null 2>&1 &
+/etc/clash-rs/netwifi-tune.sh >/dev/null 2>&1 &
+
+# OOM保护: 保护关键网络进程
+for _p in netifd dnsmasq; do
+    pidof $_p 2>/dev/null | while read _pid; do
+        echo -1000 > /proc/$_pid/oom_score_adj 2>/dev/null
+    done
+done
+
+exit 0

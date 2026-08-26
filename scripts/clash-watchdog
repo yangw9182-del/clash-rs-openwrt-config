@@ -1,0 +1,524 @@
+#!/bin/sh
+# clash-rs memory + health watchdog v7
+# 改进:
+# 1. EMA滤波平滑内存值 (避免瞬时波动误触发)
+# 2. 自适应检测周期 (内存充足慢检查, 紧张快检查)
+# 3. 永不退出 (break->continue, 重启后继续监控)
+# 4. 非阻塞重启 (后台restart, watchdog继续监控)
+# 5. 紧急处理不立即restart (等内存恢复再restart)
+# 6. 时间戳触发节点检查 (不依赖固定次数)
+# 7. watchdog OOM保护 (启动时设置oom_score_adj=-1000)
+
+trap 'echo "$(date): watchdog received signal, exiting" >> $LOG_FILE; exit 0' TERM INT
+
+PID_FILE=/var/run/clash-rs.pid
+CLASH_BIN=/etc/clash-rs/clash-rs
+# CONFIG=/etc/clash-rs/config.yaml  # 未使用
+# CLASH_LOG=/var/log/clash-rs.log  # 未使用
+MEM_THRESHOLD_FILE=/etc/clash-rs/mem_threshold
+NODE_HEALTH_FILE=/etc/clash-rs/node_health_check
+LOG_FILE=/var/log/clash-watchdog.log
+RESTART_FLAG=/tmp/clash-rs-restarting
+WATCHDOG_PID_FILE=/var/run/clash-watchdog.pid
+
+CRASH_COUNT=0
+MAX_CRASH_COUNT=10          # 连续崩溃超过此值则停止重启, 等待人工干预
+LAST_NODE_CHECK=0
+NODE_CHECK_INTERVAL=300     # 5分钟(秒)
+
+# EMA参数: alpha=30%新值 + 70%历史值
+EMA_ALPHA=30
+EMA_AVAIL=0
+EMA_VMRSS=0
+EMA_AVAIL_INIT=0   # 系统内存EMA是否已初始化
+EMA_VMRSS_INIT=0   # VmRSS EMA是否已初始化
+
+# 系统内存阈值(KB) - 同时作为 adaptive_sleep 的分级边界
+# 系统内存阈值(KB) - 基于实际内存状况设计 (2026-08-15)
+# 总内存: 165MB | 常驻可用: 19-33MB | clash-rs RSS: 18MB
+# 崩溃后可用: 37-51MB | Slab: 63MB 不可回收(内核占用)
+# 设计原则: 阈值低于常驻可用(19MB)才进行紧凑检查, 高于崩溃后可用(37MB)则正常
+# 崩溃恢复阈值 20MB: 崩溃后可用37-51MB远大于20MB, 立即恢复
+# 档位: >40MB 60s / 30-40MB 30s / 15-30MB 20s / 8-15MB 10s / <8MB 2s
+SYS_MEM_EMERGENCY=8192        # 8MB: 保底, 紧急移除规则
+SYS_MEM_RECOVER=15360         # 15MB: 崩溃恢复阈值(崩溃后可用35-51MB>15MB, 立即重启)
+SYS_MEM_CRASH_RECOVER=15360   # 15MB: 崩溃恢复阈值(同RECOVER)
+SYS_MEM_OK=30000              # 30MB: 正常档
+SYS_MEM_GOOD=40000            # 40MB: 充足档
+SYS_MEM_TIGHT=12000           # 12MB: 紧凑检查阈值
+SLEEP_SEC_EMERGENCY=2         # <8MB: 2s
+SLEEP_SEC_MODERATE=10         # 8-12MB: 10s
+SLEEP_SEC_NORMAL=20           # 12-30MB: 20s (常驻范围)
+SLEEP_SEC_OK=30               # 30-40MB: 30s
+SLEEP_SEC_GOOD=60             # >40MB: 60sMEM_CRASH_RECOVER/1024))MB:  2s
+# SLEEP_SEC_TIGHT=5           # 未使用(档位用SLEEP_SEC_MODERATE=10)
+SLEEP_SEC_MODERATE=10        # 8-20MB: 10s
+SLEEP_SEC_NORMAL=20          # 37-60MB: 20s
+SLEEP_SEC_OK=30              # 60-80MB: 30s
+SLEEP_SEC_GOOD=60            # >80MB:  60s
+
+# 紧急状态标志: 移除规则后置1, 内存恢复后需restart恢复规则
+EMERGENCY_MODE=0
+# 日志去重标志: 避免相同状态重复打印日志刷屏
+FATAL_LOGGED=0               # MAX_CRASH FATAL已打印过
+MEMLOW_LOGGED=0              # 内存不足等待已打印过
+RECOVERY_WAIT_LOGGED=0       # 紧急恢复等待已打印过
+
+# ============== OOM保护: 确保watchdog不被内核杀死 ==============
+# 设置自身oom_score_adj=-1000 (完全禁用OOM)
+if [ -w /proc/self/oom_score_adj ]; then
+    echo -1000 > /proc/self/oom_score_adj 2>/dev/null
+fi
+# 记录watchdog PID (供init脚本查询, 确保写入成功)
+# 单实例保护: 基于 PID 文件的严格检查
+# 修复: 不用 pgrep -f 路径匹配(会误匹配启动辅助shell/SSH命令链导致误退),
+# 只用 PID 文件 + kill -0 判断真实进程是否存活
+if [ -s "$WATCHDOG_PID_FILE" ] && kill -0 $(cat $WATCHDOG_PID_FILE 2>/dev/null) 2>/dev/null; then
+    echo "$(date): watchdog already running (PID=$(cat $WATCHDOG_PID_FILE 2>/dev/null)), exiting" >> $LOG_FILE
+    exit 0
+fi
+# PID 文件不存在或指向已死进程: 正常启动 (覆盖 PID 文件)
+echo $$ > $WATCHDOG_PID_FILE
+chmod 644 $WATCHDOG_PID_FILE 2>/dev/null
+
+# 移除所有劫持规则 (幂等: 不存在时-D失败被2>/dev/null吞掉)
+remove_hijack_rules() {
+    iptables -t mangle -F clash_mark 2>/dev/null
+    iptables -t mangle -D PREROUTING -p tcp -j clash_mark 2>/dev/null
+    # 循环删除, 防止有多条规则残留
+    while iptables -t nat -D PREROUTING -p udp --dport 53 -j clash_dns 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p tcp --dport 53 -j clash_dns 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p tcp -j clash_reroute 2>/dev/null; do :; done
+}
+
+# 恢复DNS直连 (使用UCI, 与init脚本一致)
+disable_redirect() {
+    # 紧急模式: 移除透明代理 REDIRECT 规则，让流量直连
+    # 移除 clash_reroute 链的 REDIRECT 规则（TCP → 7892）
+    iptables -t nat -D clash_reroute -p tcp -j REDIRECT --to-ports 7892 2>/dev/null
+    # 移除 clash_dns 链的 REDIRECT 规则（DNS → 1053）
+    iptables -t nat -D clash_dns -p udp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
+    iptables -t nat -D clash_dns -p tcp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
+    echo "$(date): emergency: redirect rules removed (traffic direct)" >> $LOG_FILE
+}
+
+restore_dns_direct() {
+    # 确保dnsmasq有上游DNS (通过UCI持久化, 与init脚本optimize_network一致)
+    # 修复: del_list不指定值时不会删除任何条目, 改用delete删除整个list
+    uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
+    uci -q add_list dhcp.@dnsmasq[0].server='119.29.29.29' 2>/dev/null
+    uci -q add_list dhcp.@dnsmasq[0].server='223.5.5.5' 2>/dev/null
+    uci -q set dhcp.@dnsmasq[0].noresolv=1 2>/dev/null
+    uci -q commit dhcp 2>/dev/null
+    # 同时恢复/tmp/resolv.conf (路由器自身DNS)
+    echo "nameserver 119.29.29.29" > /tmp/resolv.conf 2>/dev/null
+    echo "nameserver 223.5.5.5" >> /tmp/resolv.conf 2>/dev/null
+    # 修复: 用HUP重载而非restart(不fork新进程, 避免内存紧张时OOM)
+    killall -9 dnsmasq 2>/dev/null
+    /etc/init.d/dnsmasq start >/dev/null 2>&1 &
+    sleep 1
+    _pp=$(pidof dnsmasq 2>/dev/null); [ -n "$_pp" ] && echo -1000 > /proc/$_pp/oom_score_adj 2>/dev/null
+
+}
+
+# 恢复DNS走clash-rs (clash恢复后调用, 过滤AAAA只留IPv4)
+restore_dns_clash() {
+    uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
+    uci -q add_list dhcp.@dnsmasq[0].server='127.0.0.1#1053' 2>/dev/null
+    uci -q set dhcp.@dnsmasq[0].noresolv=1 2>/dev/null
+    uci -q commit dhcp 2>/dev/null
+    echo "nameserver 127.0.0.1" > /tmp/resolv.conf 2>/dev/null
+    echo "nameserver 127.0.0.1" > /tmp/resolv.conf.auto 2>/dev/null
+    # 修复: 用HUP重载而非restart(不fork新进程, 避免内存紧张时OOM)
+    killall -9 dnsmasq 2>/dev/null
+    /etc/init.d/dnsmasq start >/dev/null 2>&1 &
+    sleep 1
+    _pp=$(pidof dnsmasq 2>/dev/null); [ -n "$_pp" ] && echo -1000 > /proc/$_pp/oom_score_adj 2>/dev/null
+
+}
+
+# 获取系统可用内存(KB)
+get_sys_available() {
+    grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}'
+}
+
+# 获取clash-rs VmRSS(KB)
+# 注意: 不使用local (POSIX sh兼容), 用全局变量
+get_clash_vmrss() {
+    _pid=$(cat $PID_FILE 2>/dev/null)
+    # 修复: 验证进程身份(comm=clash-rs), 防止PID文件残留+内核PID复用导致误读其他进程内存
+    if [ -n "$_pid" ] && [ "$(cat /proc/$_pid/comm 2>/dev/null)" = "clash-rs" ]; then
+        grep VmRSS /proc/$_pid/status 2>/dev/null | awk '{print $2}'
+    fi
+}
+
+# 检查clash-rs是否运行
+is_clash_running() {
+    _pid=$(cat $PID_FILE 2>/dev/null)
+    # 修复: 验证进程身份(comm=clash-rs), 防止PID文件残留+内核PID复用导致误判运行中、崩溃恢复失效
+    [ -n "$_pid" ] && [ "$(cat /proc/$_pid/comm 2>/dev/null)" = "clash-rs" ]
+}
+
+# 重置VmRSS EMA (restart后调用, 避免旧高值影响新进程)
+reset_vmrss_ema() {
+    EMA_VMRSS=0
+    EMA_VMRSS_INIT=0
+}
+
+# 自适应sleep周期(秒), 基于EMA可用内存
+# 内存越大 -> 检测周期越长 (慢检查, 减少CPU开销)
+# 内存越小 -> 检测周期越大 (快检查, 及时响应)
+# 阈值引用上方变量, 保持一致性
+adaptive_sleep() {
+    _ema_avail=$1
+    # 档位(阈值递减): >80MB 60s / 60-80 30s / 20-60 20s / 8-20 10s / <$((SYS_MEM_CRASH_RECOVER/1024))MB 2s
+    if [ "$_ema_avail" -gt "$SYS_MEM_GOOD" ]; then
+        _sleep_sec=$SLEEP_SEC_GOOD
+    elif [ "$_ema_avail" -gt "$SYS_MEM_OK" ]; then
+        _sleep_sec=$SLEEP_SEC_OK
+    elif [ "$_ema_avail" -gt "$SYS_MEM_TIGHT" ]; then
+        _sleep_sec=$SLEEP_SEC_NORMAL   # 20-60MB: 20s
+    elif [ "$_ema_avail" -gt "$SYS_MEM_EMERGENCY" ]; then
+        _sleep_sec=$SLEEP_SEC_MODERATE # 8-20MB: 10s (修复: 原档位引用RECOVER(8MB), 比TIGHT(20MB)小, 导致TIGHT/EMERGENCY分支不可达)
+    else
+        _sleep_sec=$SLEEP_SEC_EMERGENCY # <$((SYS_MEM_CRASH_RECOVER/1024))MB: 2s
+    fi
+    sleep $_sleep_sec
+}
+
+# 非阻塞重启clash-rs (后台执行, 设置标志防止重复)
+async_restart() {
+    if [ -f "$RESTART_FLAG" ]; then
+        # 已在重启中, 跳过
+        return
+    fi
+    touch "$RESTART_FLAG"
+    echo "$(date): async restart triggered" >> $LOG_FILE
+    # 修复: 检查clash-rs二进制是否存在, 避免无限重试
+    if [ ! -x "$CLASH_BIN" ]; then
+        echo "$(date): FATAL: clash-rs binary not found at $CLASH_BIN, abort restart" >> $LOG_FILE
+        rm -f "$RESTART_FLAG" 2>/dev/null
+        return
+    fi
+    # 重置VmRSS EMA: 新进程内存从0开始, 旧EMA不再有效
+    reset_vmrss_ema
+    (
+        # 不调用restart()(会杀watchdog), 直接重启进程
+        # 杀掉所有clash-rs进程(不只PID_FILE里的), 避免多进程端口冲突
+        killall -9 clash-rs 2>/dev/null
+        sleep 3
+        # 确保所有进程已退出(防止端口未释放导致新进程绑定失败)
+        for _i in 1 2 3 4 5; do
+            pidof clash-rs >/dev/null 2>&1 || break
+            killall -9 clash-rs 2>/dev/null
+            sleep 1
+        done
+        rm -f /var/run/clash-rs.pid 2>/dev/null
+        MEM_LIMIT=$(cat /etc/clash-rs/mem_threshold 2>/dev/null)
+        [ -z "$MEM_LIMIT" ] && MEM_LIMIT=48128
+        MEM_LIMIT_MB=$((MEM_LIMIT / 1024))
+        export MALLOC_ARENA_MAX=1
+    export CLASH_RS_HEALTHCHECK_CONCURRENCY=4
+        [ "$MEM_LIMIT_MB" -gt 0 ] 2>/dev/null && export CLASH_RS_MEM_LIMIT_MB="${MEM_LIMIT_MB}:soft"
+        ulimit -n 65536 2>/dev/null
+        if [ "$CRASH_COUNT" -ge 2 ] && [ -s /etc/clash-rs/config.yaml.lastgood ]; then
+            if ! cmp -s /etc/clash-rs/config.yaml /etc/clash-rs/config.yaml.lastgood >/dev/null 2>&1; then
+                cp /etc/clash-rs/config.yaml.lastgood /etc/clash-rs/config.yaml 2>/dev/null
+                echo "$(date): config restored from lastgood (crash_count=$CRASH_COUNT)" >> $LOG_FILE
+            fi
+        fi
+        /etc/clash-rs/clash-rs -f /etc/clash-rs/config.yaml >> /var/log/clash-rs.log 2>&1 &
+        NEWPID=$!
+        # 修复: -1000为最高优先级(原-500不够高)
+        echo -1000 > /proc/$NEWPID/oom_score_adj 2>/dev/null
+        unset MALLOC_ARENA_MAX CLASH_RS_MEM_LIMIT_MB
+        # 等待启动并验证端口绑定
+        sleep 2
+        if kill -0 $NEWPID 2>/dev/null && netstat -tln 2>/dev/null | grep -q ':9090'; then
+            echo "$(date): clash-rs started OK (PID=$NEWPID, port bound)" >> $LOG_FILE
+            if ! cmp -s /etc/clash-rs/config.yaml /etc/clash-rs/config.yaml.lastgood >/dev/null 2>&1; then
+                cp /etc/clash-rs/config.yaml /etc/clash-rs/config.yaml.lastgood 2>/dev/null
+            fi
+            echo $NEWPID > /var/run/clash-rs.pid
+            restore_dns_clash
+        else
+            # 修复: 等待 5s 重试端口绑定，避免初始化期(2-5s)误杀
+            sleep 10
+            if kill -0 $NEWPID 2>/dev/null && netstat -tln 2>/dev/null | grep -q ':9090'; then
+                echo "$(date): clash-rs started OK (PID=$NEWPID, port bound after retry)" >> $LOG_FILE
+            echo $NEWPID > /var/run/clash-rs.pid
+                restore_dns_clash
+            else
+                echo "$(date): WARN: clash-rs port not bound (PID=$NEWPID), killing and retry" >> $LOG_FILE
+                kill -9 $NEWPID 2>/dev/null
+            fi
+        fi
+        rm -f "$RESTART_FLAG"
+        # 恢复iptables跳转规则(紧急模式移除后必须重新添加)
+        iptables -t nat -C PREROUTING -p udp --dport 53 -j clash_dns 2>/dev/null || \
+            iptables -t nat -I PREROUTING 1 -p udp --dport 53 -j clash_dns 2>/dev/null
+        iptables -t nat -C PREROUTING -p tcp --dport 53 -j clash_dns 2>/dev/null || \
+            iptables -t nat -I PREROUTING 1 -p tcp --dport 53 -j clash_dns 2>/dev/null
+        iptables -t nat -C PREROUTING -p tcp -j clash_reroute 2>/dev/null || \
+            iptables -t nat -I PREROUTING 1 -p tcp -j clash_reroute 2>/dev/null
+        # 恢复 REDIRECT 规则（wrapper 移除后需要重新添加）
+        iptables -t nat -I clash_reroute 1 -p tcp -m multiport --dports 7890,7892,7893,9090,1053 -j RETURN 2>/dev/null
+iptables -t nat -C clash_reroute -p tcp -j REDIRECT --to-ports 7892 2>/dev/null || iptables -t nat -A clash_reroute -p tcp -j REDIRECT --to-ports 7892 2>/dev/null
+        iptables -t nat -C clash_dns -p udp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null || iptables -t nat -A clash_dns -p udp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
+        iptables -t nat -C clash_dns -p tcp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null || iptables -t nat -A clash_dns -p tcp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
+        echo "$(date): async restart done (iptables+REDIRECT restored)" >> $LOG_FILE
+    ) &
+}
+
+# 当前时间戳(秒)
+now_ts() {
+    date +%s
+}
+
+# ============== 启动时清理残留状态 ==============
+# 防止上次异常退出导致RESTART_FLAG残留(会使崩溃恢复失效)
+rm -f "$RESTART_FLAG" 2>/dev/null
+
+# ============== 主循环 ==============
+while true; do
+    # === 1. 读取系统可用内存 ===
+    SYS_AVAIL=$(get_sys_available)
+
+    # === 2. 更新EMA (系统可用内存) ===
+    if [ -n "$SYS_AVAIL" ] && [ "$SYS_AVAIL" -gt 0 ] 2>/dev/null; then
+        if [ "$EMA_AVAIL_INIT" -eq 0 ]; then
+            # 首次采样: 直接用当前值, 避免从0缓慢爬升
+            EMA_AVAIL=$SYS_AVAIL
+            EMA_AVAIL_INIT=1
+        else
+            # EMA: ema = alpha*current + (1-alpha)*ema_prev
+            EMA_AVAIL=$((EMA_ALPHA * SYS_AVAIL / 100 + (100 - EMA_ALPHA) * EMA_AVAIL / 100))
+        fi
+    fi
+
+    EMA_AVAIL_MB=$((EMA_AVAIL / 1024))
+
+    # === 3. 系统级内存紧急检查 (基于EMA) ===
+    # EMA<$((SYS_MEM_CRASH_RECOVER/1024))MB: 立即移除规则, 不restart(等内存恢复)
+    # 修复: EMA未初始化(首次内存读取失败,EMA=0)时不进入紧急模式, 避免误移除劫持规则
+    if [ "$EMA_AVAIL_INIT" -eq 1 ] && [ "$EMA_AVAIL" -lt "$SYS_MEM_EMERGENCY" ]; then
+        if [ "$EMERGENCY_MODE" -eq 0 ]; then
+            # 首次进入紧急模式才记录和移除规则 (避免日志刷屏)
+            echo "$(date): EMERGENCY: EMA_avail=${EMA_AVAIL_MB}MB < $((SYS_MEM_CRASH_RECOVER/1024))MB, removing hijack rules" >> $LOG_FILE
+            remove_hijack_rules
+            disable_redirect
+            restore_dns_direct
+            EMERGENCY_MODE=1
+            RECOVERY_WAIT_LOGGED=0
+            echo "$(date): rules removed, CN traffic direct, EMERGENCY_MODE=1" >> $LOG_FILE
+        fi
+        # 不立即restart! 等内存恢复 (restart会重添规则, 内存不足又会崩)
+        # 自适应检查: 内存越低检查越频繁 (检查本身只读/proc, 不消耗资源)
+        adaptive_sleep "$EMA_AVAIL"
+        continue
+    fi
+
+    # === 3b. 紧急模式恢复: 内存恢复到安全水平后restart恢复规则 ===
+    # 恢复阈值=8MB: 崩溃后clash-rs释放自身RSS, 可用内存自动回升, 立即重启恢复规则
+    if [ "$EMERGENCY_MODE" -eq 1 ]; then
+        if [ "$EMA_AVAIL" -ge "$SYS_MEM_CRASH_RECOVER" ]; then
+            echo "$(date): EMERGENCY recovery: EMA_avail=${EMA_AVAIL_MB}MB >= $((SYS_MEM_CRASH_RECOVER/1024))MB, restarting to restore rules" >> $LOG_FILE
+            EMERGENCY_MODE=0
+            RECOVERY_WAIT_LOGGED=0
+            CRASH_COUNT=0
+            async_restart
+        else
+            # 内存还没恢复到安全水平, 继续等待, 保持直连
+            # 日志去重: 只在首次进入恢复等待时打印
+            if [ "$RECOVERY_WAIT_LOGGED" -eq 0 ]; then
+                echo "$(date): waiting for memory recovery (current=${EMA_AVAIL_MB}MB, need>=$((SYS_MEM_CRASH_RECOVER/1024))MB)" >> $LOG_FILE
+                RECOVERY_WAIT_LOGGED=1
+            fi
+            adaptive_sleep "$EMA_AVAIL"
+            continue
+        fi
+    fi
+
+    # === 3c. RESTART_FLAG超时清理: 子shell异常退出时标志会残留 ===
+    # 超过120秒自动清理, 避免崩溃恢复永久失效
+    if [ -f "$RESTART_FLAG" ]; then
+        _flag_age=$(( $(date +%s) - $(stat -c %Y "$RESTART_FLAG" 2>/dev/null || echo 0) ))
+        if [ "$_flag_age" -gt 120 ]; then
+            echo "$(date): WARN: RESTART_FLAG stale (${_flag_age}s), removing" >> $LOG_FILE
+            rm -f "$RESTART_FLAG" 2>/dev/null
+        fi
+    fi
+
+    # === 3d. 多进程检测: 清理重复的clash-rs进程(核心bug修复) ===
+    # 修复: 用pidof精确匹配进程名, 避免ps|grep匹配到async_restart子shell命令行
+    CLASH_PROC_COUNT=$(pidof clash-rs 2>/dev/null | wc -w)
+    if [ "$CLASH_PROC_COUNT" -gt 1 ]; then
+        echo "$(date): WARN: $CLASH_PROC_COUNT clash-rs processes detected, killing all and restarting" >> $LOG_FILE
+        # 修复: 清理后直接async_restart(内部统一处理killall+重启+恢复规则+重置EMA),
+        # 避免走崩溃恢复路径导致CRASH_COUNT误增和DNS短暂切换
+        rm -f /var/run/clash-rs.pid 2>/dev/null
+        async_restart
+        adaptive_sleep "$EMA_AVAIL"
+        continue
+    fi
+
+    # === 4. 检测clash-rs是否运行 ===
+    if ! is_clash_running; then
+        # 检查是否在重启中
+        if [ -f "$RESTART_FLAG" ]; then
+            # 重启中, 自适应等待 (内存紧张时更频繁检查重启是否完成)
+            adaptive_sleep "$EMA_AVAIL"
+            continue
+        fi
+
+        # 连续崩溃保护: 超过MAX_CRASH_COUNT则停止重启, 避免无限循环
+        CRASH_COUNT=$((CRASH_COUNT + 1))
+        if [ "$CRASH_COUNT" -ge "$MAX_CRASH_COUNT" ]; then
+            # 日志去重: 只在首次达到MAX_CRASH时打印FATAL
+            if [ "$FATAL_LOGGED" -eq 0 ]; then
+                echo "$(date): FATAL: clash-rs crashed $CRASH_COUNT times, stopping auto-restart (manual intervention required)" >> $LOG_FILE
+                FATAL_LOGGED=1
+            fi
+            # 保持直连, 每60秒检查一次内存是否恢复
+            sleep 60
+            # 内存恢复后重置计数, 允许再次尝试
+            if [ "$EMA_AVAIL" -ge "$SYS_MEM_RECOVER" ]; then
+                CRASH_COUNT=0
+                FATAL_LOGGED=0
+                echo "$(date): memory recovered (${EMA_AVAIL_MB}MB), resetting crash count" >> $LOG_FILE
+            fi
+            continue
+        fi
+
+        echo "$(date): clash-rs not running (count=$CRASH_COUNT/$MAX_CRASH_COUNT, EMA_avail=${EMA_AVAIL_MB}MB)" >> $LOG_FILE
+
+        # 立即移除劫持规则
+        remove_hijack_rules
+        disable_redirect
+        restore_dns_direct
+        echo "$(date): hijack rules removed, DNS restored" >> $LOG_FILE
+
+        # 内存充足才restart (恢复阈值=8MB, 崩溃释放内存后通常立即满足)
+        if [ "$EMA_AVAIL" -ge "$SYS_MEM_CRASH_RECOVER" ]; then
+            echo "$(date): restarting clash-rs (memory OK: ${EMA_AVAIL_MB}MB >= $((SYS_MEM_CRASH_RECOVER/1024))MB)" >> $LOG_FILE
+            MEMLOW_LOGGED=0
+            async_restart
+        else
+            # 日志去重: 只在首次进入内存不足等待时打印
+            if [ "$MEMLOW_LOGGED" -eq 0 ]; then
+                echo "$(date): memory very low (${EMA_AVAIL_MB}MB < $((SYS_MEM_CRASH_RECOVER/1024))MB), waiting before restart" >> $LOG_FILE
+                MEMLOW_LOGGED=1
+            fi
+            # 内存不足, 自适应等待 (内存越低检查越频繁, 及时发现内存恢复)
+            adaptive_sleep "$EMA_AVAIL"
+            continue
+        fi
+        continue
+    fi
+
+    # clash-rs在运行, 重置崩溃计数
+    if [ "$CRASH_COUNT" -gt 0 ]; then
+        echo "$(date): clash-rs recovered, resetting crash count" >> $LOG_FILE
+        CRASH_COUNT=0
+    fi
+
+    # === 4b. iptables自愈: 确保跳转规则存在 ===
+    if [ "$EMERGENCY_MODE" -eq 0 ]; then
+        iptables -t nat -C PREROUTING -p udp --dport 53 -j clash_dns 2>/dev/null || \
+            iptables -t nat -I PREROUTING 1 -p udp --dport 53 -j clash_dns 2>/dev/null
+        iptables -t nat -C PREROUTING -p tcp --dport 53 -j clash_dns 2>/dev/null || \
+            iptables -t nat -I PREROUTING 1 -p tcp --dport 53 -j clash_dns 2>/dev/null
+        iptables -t nat -C PREROUTING -p tcp -j clash_reroute 2>/dev/null || \
+            iptables -t nat -I PREROUTING 1 -p tcp -j clash_reroute 2>/dev/null
+    fi
+
+    # === 4c. 端口健康检查(修复1: 进程存活但9090未监听=启动失败残留假活; 修复2: 03:19实测REDIR-IN(7892)单独挂掉时9090仍正常, 原检查漏掉导致断网未自愈) ===
+    # 防抖: 连续2轮未监听才重启, 避免clash-rs启动期(2-5s)误杀
+    PORT_UNBOUND_COUNT=${PORT_UNBOUND_COUNT:-0}
+    if [ "$EMERGENCY_MODE" -eq 0 ]; then
+        if ! { netstat -tln 2>/dev/null | grep -q ':9090' && netstat -tln 2>/dev/null | grep -q ':7892'; }; then
+            PORT_UNBOUND_COUNT=$((PORT_UNBOUND_COUNT + 1))
+            if [ "$PORT_UNBOUND_COUNT" -ge 2 ]; then
+                echo "$(date): WARN: clash-rs alive but 9090/7892 not listening (${PORT_UNBOUND_COUNT} rounds), restarting" >> $LOG_FILE
+                rm -f /var/run/clash-rs.pid 2>/dev/null
+                async_restart
+                adaptive_sleep "$EMA_AVAIL"
+                continue
+            fi
+        else
+            PORT_UNBOUND_COUNT=0
+        fi
+    fi
+
+    # === 5. 节点健康检查 (基于时间戳, 每5分钟) ===
+    CURRENT_TS=$(now_ts)
+    if [ "$LAST_NODE_CHECK" -eq 0 ]; then
+        LAST_NODE_CHECK=$CURRENT_TS
+    fi
+    ELAPSED=$((CURRENT_TS - LAST_NODE_CHECK))
+    # 防御NTP时间回调: ELAPSED<0时重置基准
+    if [ "$ELAPSED" -lt 0 ]; then
+        LAST_NODE_CHECK=$CURRENT_TS
+        ELAPSED=0
+    fi
+    if [ "$ELAPSED" -ge "$NODE_CHECK_INTERVAL" ]; then
+        LAST_NODE_CHECK=$CURRENT_TS
+        NODE_HEALTH=$(cat $NODE_HEALTH_FILE 2>/dev/null)
+        if [ "$NODE_HEALTH" = "1" ]; then
+            # 轻量健康检查: 只读取 AUTO now(不触发全组测速卡API)
+            # 全组 delay 测速(force)会并发测48节点卡死API 20-35s, 且测速由url-test组自身interval管理
+            HEALTH_RESULT=$(curl -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer clashrs2026" "http://127.0.0.1:9090/proxies/AUTO" 2>/dev/null | grep -o '"now":"[^"]*"' | head -1)
+            echo "$(date): AUTO health check: ${HEALTH_RESULT:-empty}" >> $LOG_FILE
+            if [ -z "$HEALTH_RESULT" ]; then
+                echo "$(date): AUTO health check FAILED, triggering fix-nodes" >> $LOG_FILE
+                flock -n /tmp/fix-nodes.lock -c "/usr/bin/fix-nodes >/dev/null 2>&1" &
+            fi
+        fi
+    fi
+
+    # === 6. clash-rs VmRSS检查 (EMA滤波) ===
+    THRESHOLD=$(cat $MEM_THRESHOLD_FILE 2>/dev/null)
+    # 健壮性: 空值或非数字时使用默认值
+    # 修复: 用-ge 0判断, 保留0(不限制); 原-gt 0会把0覆盖成43008, 使"0=不限制"失效
+    if [ -z "$THRESHOLD" ] || ! [ "$THRESHOLD" -ge 0 ] 2>/dev/null; then
+        THRESHOLD=48128
+    fi
+    # THRESHOLD=0表示不限制内存, 跳过VmRSS检查
+    if [ "$THRESHOLD" -eq 0 ]; then
+        adaptive_sleep "$EMA_AVAIL"
+        continue
+    fi
+
+    VMRSS=$(get_clash_vmrss)
+    if [ -n "$VMRSS" ]; then
+        # 更新VmRSS的EMA (独立初始化标志)
+        if [ "$EMA_VMRSS_INIT" -eq 0 ]; then
+            EMA_VMRSS=$VMRSS
+            EMA_VMRSS_INIT=1
+        else
+            EMA_VMRSS=$((EMA_ALPHA * VMRSS / 100 + (100 - EMA_ALPHA) * EMA_VMRSS / 100))
+        fi
+
+        # watchdog阈值 = 1.5倍限制
+        WATCHDOG_THRESHOLD=$((THRESHOLD + THRESHOLD / 2))
+        if [ "$EMA_VMRSS" -gt "$WATCHDOG_THRESHOLD" ]; then
+            VMRSS_MB=$((VMRSS / 1024))
+            EMA_MB=$((EMA_VMRSS / 1024))
+            THRESHOLD_MB=$((WATCHDOG_THRESHOLD / 1024))
+            echo "$(date): EMA_VmRSS=${EMA_MB}MB (raw=${VMRSS_MB}MB) > ${THRESHOLD_MB}MB, restarting" >> $LOG_FILE
+            async_restart
+            # 不break! 继续监控
+        fi
+    fi
+
+    # 非阻塞清理已结束的子进程(避免僵尸进程堆积, 不阻塞主循环)
+    # 修复: busybox ps输出格式为 PID USER STAT VSZ RSS COMMAND
+    #   Z在STAT列(第3列), 用awk精确匹配STAT列包含Z的行
+    #   原正则root.*[Z]会误匹配COMMAND列包含Z的进程
+    # 修复: heredoc是quoted(不展开变量), 应直接写$3/$1; 原转义写法在awk中匹配字面$3, 僵尸检测永不生效
+    for _zpid in $(ps | awk '$3 ~ /Z/ {print $1}' 2>/dev/null); do
+        wait $_zpid 2>/dev/null
+    done
+    # === 7. 自适应sleep ===
+    adaptive_sleep "$EMA_AVAIL"
+done

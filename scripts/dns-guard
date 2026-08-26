@@ -1,0 +1,33 @@
+#!/bin/sh
+# dns-guard: 确保 dnsmasq 上游 = 127.0.0.1#1053 (clash-rs DNS)
+# 如果 clash-rs 不在运行，不修改（保持 119/223 直连）
+
+# 检查 clash-rs 是否运行
+if ! pidof clash-rs >/dev/null 2>&1; then
+    exit 0
+fi
+
+# 检查 clash-rs DNS 端口是否监听
+if ! netstat -tln 2>/dev/null | grep -q ':1053 '; then
+    exit 0
+fi
+
+# 检查 UCI
+_current=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | head -1)
+if [ "$_current" != "127.0.0.1#1053" ]; then
+    uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
+    uci -q add_list dhcp.@dnsmasq[0].server='127.0.0.1#1053' 2>/dev/null
+    uci -q commit dhcp 2>/dev/null
+    killall -9 dnsmasq 2>/dev/null
+    /etc/init.d/dnsmasq start >/dev/null 2>&1 &
+    sleep 1
+    _pp=$(pidof dnsmasq 2>/dev/null | awk '{print $1}'); [ -n "$_pp" ] && echo -1000 > /proc/$_pp/oom_score_adj 2>/dev/null
+fi
+
+# ===== OOM 兜底: 无条件确保 dnsmasq oom_score_adj=-1000 (每10分钟检查) =====
+# 即使重启后 OOM 被重置, 这里也能恢复
+_pp=$(pidof dnsmasq 2>/dev/null | awk '{print $1}')
+if [ -n "$_pp" ]; then
+    cur=$(cat /proc/$_pp/oom_score_adj 2>/dev/null)
+    [ "$cur" != "-1000" ] 2>/dev/null && echo -1000 > /proc/$_pp/oom_score_adj 2>/dev/null
+fi

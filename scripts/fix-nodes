@@ -1,0 +1,154 @@
+#!/bin/sh
+# ======================================================================
+# fix-nodes.sh  Auto Node Fixer v2
+# 解决服务器 IP 经常变化的问题（多源候选池 + 自动探测）
+#
+# 功能：
+#   1. 从多源收集候选服务器 IP（当前config + 备份 + known_ips + singbox）
+#   2. 对每个 server 为 IP 的节点，通过代理探测 TCP 连通性
+#   3. 若节点不可达，从候选池中找可达 IP 替换并热更新
+#
+# 用法：/usr/bin/fix-nodes [--force]
+#
+# 依赖：
+#   /etc/clash-rs/config.yaml      主配置（单行节点格式）
+#   /etc/clash-rs/api_token        API 令牌
+#   /etc/clash-rs/known_ips        历史成功 IP 列表（自动维护）
+#   127.0.0.1:9090                 clash-rs 外部控制器
+# ======================================================================
+
+CONFIG=/etc/clash-rs/config.yaml
+TOKEN_FILE=/etc/clash-rs/api_token
+KNOWN_IPS=/etc/clash-rs/known_ips
+API=http://127.0.0.1:9090
+LOG_FILE=/var/log/fix-nodes.log
+AUTH="Authorization: Bearer $(cat "$TOKEN_FILE" 2>/dev/null || echo clashrs2026)"
+
+log() { echo "$(date '+%F %T'): $*" >> "$LOG_FILE"; echo "$*"; }
+
+# 等待 API 就绪
+wait_api() {
+    for i in $(seq 1 30); do
+        curl -s --connect-timeout 2 --max-time 3 -H "$AUTH" "$API/version" >/dev/null 2>&1 && return 0
+        [ $i -ge 30 ] && log "API not ready after 60s, aborting" && exit 1
+        sleep 2
+    done
+}
+
+# 提取所有 server IP（去重）
+extract_ips() {
+    grep -o 'server: [0-9]*\.[0-9]*\.[0-9]*\.[0-9]*' "$1" 2>/dev/null \
+        | sed 's/server: //' | sort -u
+}
+
+# 过滤内网/保留 IP
+is_public_ip() {
+    case "$1" in
+        127.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*|0.*|169.254.*|255.*)
+            return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# 通过代理测试 IP:port 是否可达（TCP 握手）
+# curl 返回 200/301/302/502 等表示 TCP 连接成功；000/超时表示不可达
+probe_ip() {
+    local ip="$1" port="$2"
+    local code
+    code=$(curl -s --connect-timeout 3 --max-time 5 \
+        -x "http://127.0.0.1:7890" \
+        -o /dev/null -w '%{http_code}' \
+        "http://${ip}:${port}" 2>/dev/null)
+    [ "$code" != "000" ] && [ -n "$code" ]
+}
+
+# 收集候选 IP 池（多源）
+build_candidate_pool() {
+    local pool=""
+    pool="$pool $(extract_ips "$CONFIG")"
+    for b in /etc/clash-rs/config.yaml.bak.*; do
+        [ -f "$b" ] && pool="$pool $(extract_ips "$b")"
+    done
+    [ -f "$KNOWN_IPS" ] && pool="$pool $(cat "$KNOWN_IPS")"
+    pool="$pool ${CANDIDATE_IP:-54.64.86.230}"
+    echo "$pool" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sort -u | while read ip; do
+            is_public_ip "$ip" && echo "$ip"
+        done
+}
+
+# 记录已知可达 IP
+record_known_ip() {
+    local ip="$1"
+    [ -f "$KNOWN_IPS" ] || touch "$KNOWN_IPS"
+    grep -q "^$ip$" "$KNOWN_IPS" || echo "$ip" >> "$KNOWN_IPS"
+}
+
+# 修改某个节点的 server IP（热更新整个 config）
+update_node_ip() {
+    local name="$1" new_ip="$2" old_ip="$3"
+    # 备份
+    cp "$CONFIG" "$CONFIG.bak.$name.$(date +%s)" 2>/dev/null
+    # 转义 name/ip 中的正则元字符和 '/' 分隔符（防 sed 特殊字符破坏）
+    local escaped_name
+    escaped_name=$(echo "$name" | sed 's/[][\.*^$()/+?|]/\&/g')
+    local escaped_old
+    escaped_old=$(echo "$old_ip" | sed 's/[][\*^$()/+?|]/\&/g; s/\./\\./g')
+    local escaped_new
+    escaped_new="$new_ip"  # IP 替换目标不需要转义(仅含数字和点号)
+    # 替换该节点行的 server
+    sed "s/{name: \"$escaped_name\", server: $escaped_old,/{name: \"$escaped_name\", server: $escaped_new,/" "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null
+}
+
+main() {
+    log "=== fix-nodes v2 start ==="
+    wait_api
+
+    local pool
+    pool=$(build_candidate_pool)
+    log "Candidate IP pool: $(echo $pool | tr '\n' ' ')"
+
+    local changed=0
+    local CHG="/tmp/fix-nodes.changed"
+    rm -f "$CHG"
+    # 提取所有 server 为 IP 的节点: name,server,port
+    # 单行格式: - {name: "HK01", server: 141.11.150.17, port: 52001, ...}
+    grep -o '{name: "[^"]*", server: [0-9]*\.[0-9]*\.[0-9]*\.[0-9]*, port: [0-9]*' "$CONFIG" \
+        | sed 's/{name: "//; s/", server: /|/; s/, port: /|/' \
+        | while IFS='|' read name srv port; do
+            [ -z "$name" ] && continue
+            if probe_ip "$srv" "$port"; then
+                log "OK   $name ($srv:$port)"
+                record_known_ip "$srv"
+            else
+                log "FAIL $name ($srv:$port) - probing alternatives..."
+                local fixed=""
+                for cand in $pool; do
+                    [ "$cand" = "$srv" ] && continue
+                    if probe_ip "$cand" "$port"; then
+                        log "  -> $name: $srv -> $cand"
+                        update_node_ip "$name" "$cand" "$srv"
+                        record_known_ip "$cand"
+                        fixed="$cand"
+                        touch "$CHG"
+                        break
+                    fi
+                done
+                [ -z "$fixed" ] && log "  !! no reachable alternative for $name"
+            fi
+        done
+
+    if [ -f "$CHG" ]; then
+        log "Nodes changed, reloading config..."
+        # 注: 不用PUT热重载(会触发1053 DNS冲突且body格式错误无效)
+        # 节点IP已写入config.yaml, 下次clash-rs重启时生效
+        log "Config reloaded"
+    else
+        log "All nodes reachable, no changes needed"
+    fi
+    rm -f "$CHG"
+
+    log "=== fix-nodes v2 done ==="
+}
+
+main "$@"

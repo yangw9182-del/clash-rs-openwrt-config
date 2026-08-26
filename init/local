@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# Local startup script - executes /etc/rc.local
+START=95
+STOP=5
+
+start() {
+    [ -f /etc/rc.local ] && . /etc/rc.local
+}
+
+stop() {
+    true
+}

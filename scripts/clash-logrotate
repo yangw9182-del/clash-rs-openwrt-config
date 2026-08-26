@@ -1,0 +1,19 @@
+#!/bin/sh
+# 日志轮转 (替代logrotate)
+# 覆盖: clash-rs / clash-watchdog / fix-nodes / tune-tolerance / clash-exit
+# 最大: 100KB, 超过时保留最后50KB
+LOG_FILES="/var/log/clash-rs.log /var/log/clash-watchdog.log /var/log/fix-nodes.log /var/log/tune-tolerance.log /var/log/clash-exit.log"
+MAX_SIZE=102400    # 100KB
+KEEP_SIZE=51200    # 保留50KB
+
+for f in $LOG_FILES; do
+    if [ -f "$f" ]; then
+        SIZE=$(wc -c < "$f" 2>/dev/null)
+        if [ -n "$SIZE" ] && [ "$SIZE" -gt "$MAX_SIZE" ] 2>/dev/null; then
+            tail -c $KEEP_SIZE "$f" > "${f}.tmp" 2>/dev/null
+            cat "${f}.tmp" > "$f" 2>/dev/null
+            echo "$(date): log rotated (was ${SIZE}B, keep ${KEEP_SIZE}B)" >> "$f"
+        fi
+    fi
+done
+rm -f /var/log/*.tmp 2>/dev/null

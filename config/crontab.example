@@ -1,0 +1,9 @@
+*/10 * * * * /usr/bin/clash-logrotate 2>/dev/null
+*/5 * * * * /usr/bin/fix-tx-queue
+*/10 * * * * /usr/bin/dns-guard 2>/dev/null
+20 6 */3 * * sleep 5 && touch /etc/banner && reboot
+25 6 */3 * * /etc/clash-rs/cc.sh sub-update >/dev/null 2>&1
+*/30 * * * * flock -n /tmp/fix-nodes.lock -c "/usr/bin/fix-nodes >/dev/null 2>&1"
+*/10 * * * * /usr/bin/safe-ntp 2>/dev/null
+0 * * * * echo 1 > /proc/sys/vm/drop_caches 2>/dev/null
+*/10 * * * * /usr/bin/tune-tolerance.sh >/dev/null 2>&1
