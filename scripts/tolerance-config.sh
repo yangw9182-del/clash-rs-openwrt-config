@@ -130,7 +130,7 @@ _edit_level() {
     [ -n "$new_cnt" ] && cur_cnt=$new_cnt
     # 校验为纯数字（防 sed 注入与 source 报错）
     case "$cur_cnt" in
-        ''|*[!0-9]*) pl "${R}  无效次数: ${cur_cnt}${N}"; return 1 ;; esac
+        ''|*[!0-9]*) echo "${RED}  无效次数: ${cur_cnt}${NC}"; return 1 ;; esac
 
     echo ""
     echo "  ${WHITE}【tolerance 值(毫秒)】${NC}"
@@ -142,7 +142,7 @@ _edit_level() {
     read -r new_tol
     [ -n "$new_tol" ] && cur_tol=$new_tol
     case "$cur_tol" in
-        ''|*[!0-9]*) pl "${R}  无效 tolerance: ${cur_tol}${N}"; return 1 ;; esac
+        ''|*[!0-9]*) echo "${RED}  无效 tolerance: ${cur_tol}${NC}"; return 1 ;; esac
 
     sed -i "s/^${prefix}_COUNT=.*/${prefix}_COUNT=${cur_cnt}/" "$CONF" 2>/dev/null
     sed -i "s/^${prefix}_TOLERANCE=.*/${prefix}_TOLERANCE=${cur_tol}/" "$CONF" 2>/dev/null
@@ -218,7 +218,7 @@ case "${1:-menu}" in
             echo "     修改各级的「连续不切换次数」和「tolerance 值」"
             echo ""
             echo "  3) 恢复默认设置"
-            echo "     还原为出厂推荐值（50ms/35ms/20ms）"
+            echo "     还原为出厂推荐值（100ms/80ms/60ms）"
             echo ""
             echo "  4) 查看降级历史日志"
             echo "     看过去什么时候降级过、恢复过"

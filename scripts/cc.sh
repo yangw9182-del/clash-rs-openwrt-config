@@ -3799,7 +3799,15 @@ do_autogroup() {
                 echo "$auto_nodes" | while read n; do
                     [ -z "$n" ] && continue
                     local d
-                    d=$(echo "$all_resp" | tr ',' '\n' | grep -F "\"$n\"" | grep -oE '"delay":[0-9]+' | head -1 | sed 's/"delay"://')
+d=$(echo "$all_resp" | n="$n" awk '{
+    k = "\"" ENVIRON["n"] "\":{"
+    i = index($0, k)
+    if (i <= 0) next
+    seg = substr($0, i+length(k))
+    j = index(seg, "}")
+    if (j > 0) seg = substr(seg, 1, j-1)
+    if (match(seg, "\"delay\":[0-9]+")) print substr(seg, RSTART+8, RLENGTH-8)
+}')
                     if [ "$n" = "$ag_now" ]; then
                         printf "%-20s %s\n" "$n" "${G}${d:-N/A}ms (当前)${N}"
                     else
