@@ -1082,6 +1082,28 @@ dns:
     - '+.zijieurl.net'
     - '+.zijiewap.com'
     - '+.zijiewap.net'
+    # ===== 智能识别国内CDN（fakeip-cn-auto 2026-08-27）=====
+    - '+.xiaohongshu.com'
+    - '+.xhscdn.com'
+    - '+.xhscdn.net'
+    - '+.weibocdn.com'
+    - '+.360buyimg.com'
+    - '+.baidupcs.com'
+    - '+.qiyipic.com'
+    - '+.ykimg.com'
+    - '+.qy.net'
+    - '+.ksapisrv.com'
+    - '+.ele.me'
+    - '+.cnblogs.com'
+    - '+.diyidan.com'
+    - '+.amap.com'
+    - '+.mapbar.com'
+    - '+.autonavi.com'
+    - '+.91.com'
+    - '+.csdnimg.cn'
+    - '+.itc.cn'
+    - '+.zhimg.com'
+    - '+.biliapi.net'
     - '+.cn'
 
   nameserver:
@@ -1181,5 +1203,8 @@ rules:
   - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
   - SRC-IP-CIDR,192.168.10.1/32,DIRECT
   - DST-PORT,53,DIRECT
+  - DOMAIN-SUFFIX,xiaohongshu.com,DIRECT
+  - DOMAIN-SUFFIX,xhscdn.com,DIRECT
+  - DOMAIN-SUFFIX,xhscdn.net,DIRECT
   - GEOIP,CN,DIRECT
   - MATCH,PROXY
