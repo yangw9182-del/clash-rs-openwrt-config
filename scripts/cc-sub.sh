@@ -5676,15 +5676,38 @@ _sub_sync_manager() {
             pl "  最近更新: ${lu:-无}"
             ;;
         *)
-            pl "${C}  国内域名白名单管理${N}（主源=社区 geosite 列表, 检测没更新不下载; 补充=自学习可选）"
-            pl "  ${Y}cc sub-sync run${N}            立即更新(条件下载+自学习, 零重启)"
-            pl "  ${Y}cc sub-sync auto [LEAD]${N}    自动: 探测重启事件同频调度, 提前LEAD分钟(默认10); 无事件退化每日"
-            pl "  ${Y}cc sub-sync auto-daily on|off${N}  无重启事件时是否退化为每日(默认开)"
-            pl "  ${Y}cc sub-sync on [HH:MM]${N}     自定义定时更新, 默认06:00(订阅前30分, 避开06:20重启)"
-            pl "  ${Y}cc sub-sync off${N}            关闭定时"
-            pl "  ${Y}cc sub-sync selflearn on|off${N}  自学习开关(默认开)"
-            pl "  ${Y}cc sub-sync status${N}         状态"
-            pl "  ${W}说明:${N} geosite 列表(别人维护)更新时, 条件请求检测到没变就不下载, 零重启影响最小; 自动模式不主动重启, 靠重启/订阅更新顺带生效"
+            # 交互式选项菜单（cc sub-sync 直接回车进入）
+            while true; do
+                printf '\n'
+                line
+                pl "${C}  国内域名白名单管理${N}  ${Y}主源:geosite社区列表 + 自学习${N}"
+                line
+                pl "  ${W}1${N}. 立即更新 (条件下载+自学习, 零重启)"
+                pl "  ${W}2${N}. 自动模式 (探测重启事件同频, 提前LEAD分钟; 无事件退化每日)"
+                pl "  ${W}3${N}. 开启定时更新 (自定义 HH:MM, 默认06:00)"
+                pl "  ${W}4${N}. 关闭定时更新"
+                pl "  ${W}5${N}. 自学习开关 (当前: $([ "$SELFLEARN" = "1" ] && echo "${G}开${N}" || echo "${R}关${N}"))"
+                pl "  ${W}6${N}. 状态"
+                pl "  ${W}0${N}. 返回"
+                line
+                pl "  ${Y}说明:${N} 社区列表条件下载零重启; 自动模式靠近重启不主动重启, 靠重启/订阅更新顺带生效"
+                printf '\n  选择: '
+                read sync_menu_choice
+                case "$sync_menu_choice" in
+                    1) _sub_sync_manager run ;;
+                    2) printf '  提前量分钟 (回车=10): '
+                       read sync_lead
+                       _sub_sync_manager auto "${sync_lead:-10}" ;;
+                    3) printf '  定时时间 (HH:MM, 回车=06:00): '
+                       read sync_time
+                       _sub_sync_manager on "${sync_time:-06:00}" ;;
+                    4) _sub_sync_manager off ;;
+                    5) if [ "$SELFLEARN" = "1" ]; then _sub_sync_manager selflearn off; else _sub_sync_manager selflearn on; fi ;;
+                    6) _sub_sync_manager status ;;
+                    0) break ;;
+                    *) pl "${R}  无效${N}" ;;
+                esac
+            done
             ;;
     esac
 }
