@@ -3805,12 +3805,14 @@ do_autogroup() {
     i = index($0, k)
     if (i <= 0) next
     seg = substr($0, i + length(k))
-    depth = 1; len = length(seg); end = len
+    depth = 1; len = length(seg); end = len; found = 0
     for (p = 1; p <= len; p++) {
       c = substr(seg, p, 1)
       if (c == "{") depth++
-      else if (c == "}") { depth--; if (depth == 0) { end = p; break } }
+      else if (c == "}") { depth--; if (depth == 0) { end = p; found = 1; break } }
     }
+    # 异形响应不配平时不输出 (避免误取后续节点)
+    if (!found) next
     seg = substr(seg, 1, end-1)
     last = ""
     while (match(seg, "\"delay\":[0-9]+")) { last = substr(seg, RSTART+8, RLENGTH-8); seg = substr(seg, RSTART+RLENGTH) }
