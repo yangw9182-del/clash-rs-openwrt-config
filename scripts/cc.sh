@@ -3799,15 +3799,22 @@ do_autogroup() {
                 echo "$auto_nodes" | while read n; do
                     [ -z "$n" ] && continue
                     local d
-# 假设: 节点对象内无嵌套 {} (当前 /proxies 响应 flat, history 内 delay 对象闭合于首个 })
+# 括号配平定位节点对象边界后提取最新 delay (字段顺序不定: extra/history 前后都可能)
     d=$(echo "$all_resp" | n="$n" awk '{
     k = "\"" ENVIRON["n"] "\":{"
     i = index($0, k)
     if (i <= 0) next
-    seg = substr($0, i+length(k))
-    j = index(seg, "}")
-    if (j > 0) seg = substr(seg, 1, j-1)
-    if (match(seg, "\"delay\":[0-9]+")) print substr(seg, RSTART+8, RLENGTH-8)
+    seg = substr($0, i + length(k))
+    depth = 1; len = length(seg); end = len
+    for (p = 1; p <= len; p++) {
+      c = substr(seg, p, 1)
+      if (c == "{") depth++
+      else if (c == "}") { depth--; if (depth == 0) { end = p; break } }
+    }
+    seg = substr(seg, 1, end-1)
+    last = ""
+    while (match(seg, "\"delay\":[0-9]+")) { last = substr(seg, RSTART+8, RLENGTH-8); seg = substr(seg, RSTART+RLENGTH) }
+    if (last != "") print last
 }')
                     if [ "$n" = "$ag_now" ]; then
                         printf "%-20s %s\n" "$n" "${G}${d:-N/A}ms (当前)${N}"
