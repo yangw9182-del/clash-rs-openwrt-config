@@ -701,7 +701,8 @@ async_restart() {
         iptables -t nat -C PREROUTING -p tcp -j clash_reroute 2>/dev/null || \
             iptables -t nat -I PREROUTING 1 -p tcp -j clash_reroute 2>/dev/null
         # 恢复 REDIRECT 规则（wrapper 移除后需要重新添加）
-        iptables -t nat -I clash_reroute 1 -p tcp -m multiport --dports 7890,7892,7893,9090,1053 -j RETURN 2>/dev/null
+        iptables -t nat -C clash_reroute -p tcp -m multiport --dports 7890,7892,7893,9090,1053 -j RETURN 2>/dev/null || \
+            iptables -t nat -I clash_reroute 1 -p tcp -m multiport --dports 7890,7892,7893,9090,1053 -j RETURN 2>/dev/null
 iptables -t nat -C clash_reroute -p tcp -j REDIRECT --to-ports 7892 2>/dev/null || iptables -t nat -A clash_reroute -p tcp -j REDIRECT --to-ports 7892 2>/dev/null
         iptables -t nat -C clash_dns -p udp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null || iptables -t nat -A clash_dns -p udp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
         iptables -t nat -C clash_dns -p tcp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null || iptables -t nat -A clash_dns -p tcp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null

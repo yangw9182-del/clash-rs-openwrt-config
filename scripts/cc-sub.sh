@@ -5538,9 +5538,14 @@ $new_line"
     } > "$CONFIG.tmp"
 
     # 先 mv 再 reload（避免 reload 旧 config）
-    mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null
-    pl "${G}  更新成功: $total 个节点, 重启 clash-rs 生效${N}"
-    /etc/init.d/clash-rs restart >/dev/null 2>&1 &
+    if cmp -s "$CONFIG" "$CONFIG.tmp" 2>/dev/null; then
+        rm -f "$CONFIG.tmp"
+        pl "${G}  订阅内容无变化，跳过重启${N}"
+    else
+        mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null
+        pl "${G}  订阅已更新: $total 个节点, 重启 clash-rs 生效${N}"
+        /etc/init.d/clash-rs restart >/dev/null 2>&1 &
+    fi
     rm -f "$allnodes"
 }
 
