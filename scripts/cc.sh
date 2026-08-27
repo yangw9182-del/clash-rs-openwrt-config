@@ -1263,13 +1263,10 @@ do_test() {
 
 # 通过API热重载配置 (clash-rs 失败时保留旧配置继续运行)
 _reload_config() {
-    local result
-    result=$(curl -s -X PUT -H "Authorization: Bearer $SECRET" -H "Content-Type: application/json" \
-        -d "{\"path\":\"$CONFIG\"}" "http://${API_HOST}:${API_PORT}/configs" 2>/dev/null)
-    if [ -n "$result" ] && echo "$result" | grep -qiE '"message".*error|invalid|forbidden|not found|parse'; then
-        return 1
-    fi
-    return 0
+    # 注意: 禁用 PUT /configs 热重载（会导致 1053 Address in use 断网）
+    # 改配置后用 init.d restart 完整重启
+    /etc/init.d/clash-rs restart >/dev/null 2>&1
+    return $?
 }
 
 # 从节点定义文本中提取name (支持 flow/block style)
