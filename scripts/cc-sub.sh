@@ -1645,7 +1645,7 @@ _backup_restore() {
         line
         local arr=""
         local i=0
-        echo "$files" | tac | while read f; do
+        echo "$files" | awk '{a[NR]=$0}END{for(i=NR;i>=1;i--)print a[i]}' | while read f; do
             [ -z "$f" ] && continue
             i=$((i+1))
             local bn=$(basename "$f")
@@ -1663,7 +1663,7 @@ _backup_restore() {
         case "$choice" in
             ''|*[!0-9]*) pl "${R}  无效编号${N}"; return 1 ;;
         esac
-        picked=$(echo "$files" | tac | sed -n "${choice}p")
+        picked=$(echo "$files" | awk '{a[NR]=$0}END{for(i=NR;i>=1;i--)print a[i]}' | sed -n "${choice}p")
         [ -z "$picked" ] && { pl "${R}  编号超出范围${N}"; return 1; }
     else
         # 编号或文件名
@@ -1911,7 +1911,7 @@ _binbak_restore() {
         pl "${C}  可用备份 (最新在前)${N}"
         line
         local i=0
-        echo "$files" | tac | while read f; do
+        echo "$files" | awk '{a[NR]=$0}END{for(i=NR;i>=1;i--)print a[i]}' | while read f; do
             [ -z "$f" ] && continue
             i=$((i+1))
             local bn=$(basename "$f")
@@ -1930,7 +1930,7 @@ _binbak_restore() {
         case "$choice" in
             ''|*[!0-9]*) pl "${R}  无效编号${N}"; return 1 ;;
         esac
-        picked=$(echo "$files" | tac | sed -n "${choice}p")
+        picked=$(echo "$files" | awk '{a[NR]=$0}END{for(i=NR;i>=1;i--)print a[i]}' | sed -n "${choice}p")
         [ -z "$picked" ] && { pl "${R}  编号超出范围${N}"; return 1; }
     else
         case "$target" in
@@ -3741,7 +3741,7 @@ do_autogroup() {
                 echo "$auto_nodes" | while read n; do
                     [ -z "$n" ] && continue
                     local d
-                    d=$(echo "$all_resp" | grep -oE "\"${n}\"[^}]*\"delay\":[0-9]+" | grep -oE '"delay":[0-9]+' | head -1 | sed 's/"delay"://')
+                    d=$(echo "$all_resp" | tr ',' '\n' | grep -F "\"$n\"" | grep -oE '"delay":[0-9]+' | head -1 | sed 's/"delay"://')
                     if [ "$n" = "$ag_now" ]; then
                         printf "%-20s %s\n" "$n" "${G}${d:-N/A}ms (当前)${N}"
                     else
@@ -5027,7 +5027,7 @@ _sub_update() {
         local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
         [ -z "$decoded" ] && decoded="$name"
         echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
-        local new_line=$(echo "$line" | sed "s/name: \"$name\"/name: \"$decoded\"/" 2>/dev/null)
+        local new_line=$(name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
         [ -z "$new_line" ] && new_line="$line"
         # 去重：节点名已在列表则跳过（防止 duplicated proxy name 崩溃）
         echo "$node_names" | grep -Fqx "$decoded" && continue
@@ -5116,7 +5116,7 @@ _sub_update_one() {
         local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
         [ -z "$decoded" ] && decoded="$name"
         echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
-        local new_line=$(echo "$line" | sed "s|name: \"$name\"|name: \"$decoded\"|" 2>/dev/null)
+        local new_line=$(name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
         [ -z "$new_line" ] && new_line="$line"
         echo "$node_names" | grep -Fqx "$decoded" && continue
         node_names="$node_names
@@ -5283,6 +5283,14 @@ _sub_del() {
     printf '  输入序号删除 (0=取消): '
     read choice
     [ "$choice" = "0" ] || [ -z "$choice" ] && return
+    # 只接受纯数字（防 sed 行地址注入，如 "1d" "1,2d"）
+    case "$choice" in
+        ''|*[!0-9]*) pl "${R}  无效序号${N}"; return 1 ;;
+    esac
+    local total=$(grep -cE '.' "$_subfile")
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt "$total" ] 2>/dev/null; then
+        pl "${R}  序号超出范围 (1-$total)${N}"; return 1
+    fi
     sed -i "${choice}d" "$_subfile" 2>/dev/null
     pl "${G}  已删除${N}"
 }
@@ -5348,8 +5356,8 @@ _sub_auto_update() {
                 return
             fi
         else
-            # 设置间隔（小时）
-            local sched="*/$interval * * *"
+            # 设置间隔（小时） - 5字段: 分 时 日 月 周
+            local sched="0 */$interval * * *"
             # 如果是 24 的因数，用每天
             if [ "$interval" = "24" ]; then sched="0 0 * * *"
             elif [ "$interval" = "12" ]; then sched="0 */12 * * *"
@@ -5463,7 +5471,7 @@ _sub_update_all() {
         local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
         [ -z "$decoded" ] && decoded="$name"
         echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
-        local new_line=$(echo "$line" | sed "s/name: \"$name\"/name: \"$decoded\"/" 2>/dev/null)
+        local new_line=$(name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
         [ -z "$new_line" ] && new_line="$line"
         # 去重：节点名已在列表则跳过（防止 duplicated proxy name 崩溃）
         echo "$node_names" | grep -Fqx "$decoded" && continue

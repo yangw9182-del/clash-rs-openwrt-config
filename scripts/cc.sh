@@ -1651,7 +1651,7 @@ _backup_restore() {
         line
         local arr=""
         local i=0
-        echo "$files" | tac | while read f; do
+        echo "$files" | awk '{a[NR]=$0}END{for(i=NR;i>=1;i--)print a[i]}' | while read f; do
             [ -z "$f" ] && continue
             i=$((i+1))
             local bn=$(basename "$f")
@@ -1669,7 +1669,7 @@ _backup_restore() {
         case "$choice" in
             ''|*[!0-9]*) pl "${R}  无效编号${N}"; return 1 ;;
         esac
-        picked=$(echo "$files" | tac | sed -n "${choice}p")
+        picked=$(echo "$files" | awk '{a[NR]=$0}END{for(i=NR;i>=1;i--)print a[i]}' | sed -n "${choice}p")
         [ -z "$picked" ] && { pl "${R}  编号超出范围${N}"; return 1; }
     else
         # 编号或文件名
@@ -1917,7 +1917,7 @@ _binbak_restore() {
         pl "${C}  可用备份 (最新在前)${N}"
         line
         local i=0
-        echo "$files" | tac | while read f; do
+        echo "$files" | awk '{a[NR]=$0}END{for(i=NR;i>=1;i--)print a[i]}' | while read f; do
             [ -z "$f" ] && continue
             i=$((i+1))
             local bn=$(basename "$f")
@@ -1936,7 +1936,7 @@ _binbak_restore() {
         case "$choice" in
             ''|*[!0-9]*) pl "${R}  无效编号${N}"; return 1 ;;
         esac
-        picked=$(echo "$files" | tac | sed -n "${choice}p")
+        picked=$(echo "$files" | awk '{a[NR]=$0}END{for(i=NR;i>=1;i--)print a[i]}' | sed -n "${choice}p")
         [ -z "$picked" ] && { pl "${R}  编号超出范围${N}"; return 1; }
     else
         case "$target" in
@@ -3799,7 +3799,7 @@ do_autogroup() {
                 echo "$auto_nodes" | while read n; do
                     [ -z "$n" ] && continue
                     local d
-                    d=$(echo "$all_resp" | grep -oE "\"${n}\"[^}]*\"delay\":[0-9]+" | grep -oE '"delay":[0-9]+' | head -1 | sed 's/"delay"://')
+                    d=$(echo "$all_resp" | tr ',' '\n' | grep -F "\"$n\"" | grep -oE '"delay":[0-9]+' | head -1 | sed 's/"delay"://')
                     if [ "$n" = "$ag_now" ]; then
                         printf "%-20s %s\n" "$n" "${G}${d:-N/A}ms (当前)${N}"
                     else

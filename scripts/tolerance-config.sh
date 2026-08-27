@@ -128,6 +128,9 @@ _edit_level() {
     printf "  输入新次数 [回车保持 ${cur_cnt}]: "
     read -r new_cnt
     [ -n "$new_cnt" ] && cur_cnt=$new_cnt
+    # 校验为纯数字（防 sed 注入与 source 报错）
+    case "$cur_cnt" in
+        ''|*[!0-9]*) pl "${R}  无效次数: ${cur_cnt}${N}"; return 1 ;; esac
 
     echo ""
     echo "  ${WHITE}【tolerance 值(毫秒)】${NC}"
@@ -138,6 +141,8 @@ _edit_level() {
     printf "  输入新值 [回车保持 ${cur_tol}]: "
     read -r new_tol
     [ -n "$new_tol" ] && cur_tol=$new_tol
+    case "$cur_tol" in
+        ''|*[!0-9]*) pl "${R}  无效 tolerance: ${cur_tol}${N}"; return 1 ;; esac
 
     sed -i "s/^${prefix}_COUNT=.*/${prefix}_COUNT=${cur_cnt}/" "$CONF" 2>/dev/null
     sed -i "s/^${prefix}_TOLERANCE=.*/${prefix}_TOLERANCE=${cur_tol}/" "$CONF" 2>/dev/null
@@ -157,14 +162,14 @@ LEVEL1_TOLERANCE=80
 LEVEL2_COUNT=5
 LEVEL2_TOLERANCE=60
 CONFEOF
-    sed -i 's/    tolerance: [0-9]*/    tolerance: 50/' /etc/clash-rs/config.yaml 2>/dev/null
+    sed -i 's/    tolerance: [0-9]*/    tolerance: 100/' /etc/clash-rs/config.yaml 2>/dev/null
     /etc/init.d/clash-rs restart >/dev/null 2>&1 &
     echo "" > /tmp/tune-tolerance.dat
     echo ""
     echo "${GREEN}  ✓ 已恢复默认设置！${NC}"
-    echo "  · 初始: 连续≥10次不切换 → tolerance=50ms"
-    echo "  · 第1级: 连续≥8次不切换 → tolerance=35ms"
-    echo "  · 第2级: 连续≥5次不切换 → tolerance=20ms"
+    echo "  · 初始: 连续≥10次不切换 → tolerance=100ms"
+    echo "  · 第1级: 连续≥8次不切换 → tolerance=80ms"
+    echo "  · 第2级: 连续≥5次不切换 → tolerance=60ms"
     echo "  · clash-rs 正在重启..."
     sleep 2
 }
