@@ -5507,8 +5507,9 @@ _sub_sync_auto() {
     case "$lead" in 0?*) lead=${lead#0};; esac
     local CONF=/etc/clash-rs/fakeip-cn-auto.conf
     local tag="geosite-cn-update"
+    # 显式初始化再 source conf：防止调用者环境残留同名变量污染（如交互 shell 的 SELFLEARN=0）
+    SELFLEARN=1; DEGRADE_DAILY=1
     [ -f "$CONF" ] && . "$CONF" 2>/dev/null
-    : ${SELFLEARN:=1}; : ${DEGRADE_DAILY:=1}
     echo "$lead" | grep -qE '^[0-9]+$' || { pl "${R}  提前量必须是分钟数 (如 cc sub-sync auto 10)${N}"; return 1; }
     [ "$lead" -lt 1 ] 2>/dev/null && lead=1
     [ "$lead" -gt 180 ] 2>/dev/null && lead=180
@@ -5582,8 +5583,8 @@ _sub_sync_manager() {
     local arg2="${2:-}"
     local CONF=/etc/clash-rs/fakeip-cn-auto.conf
     local tag="geosite-cn-update"
+    SELFLEARN=1; DEGRADE_DAILY=1
     [ -f "$CONF" ] && . "$CONF" 2>/dev/null
-    : ${SELFLEARN:=1}
     case "$action" in
         run)
             pl "${C}  更新国内域名白名单（主源+自学习, 零重启）...${N}"
@@ -5639,8 +5640,26 @@ _sub_sync_manager() {
             ;;
         selflearn)
             case "$arg2" in
-                on)  SELFLEARN=1; _conf_set SELFLEARN 1 || return 1; pl "${G}  自学习已开启（geosite 主源 + 自学习补漏）${N}" ;;
-                off) SELFLEARN=0; _conf_set SELFLEARN 0 || return 1; pl "${G}  自学习已关闭（仅用社区 geosite 列表, 最省）${N}" ;;
+                on)
+                    SELFLEARN=1; _conf_set SELFLEARN 1 || return 1
+                    # 若当前已有 geosite 定时行, 按同 sched 加回自学习行
+                    local gsched=$(crontab -l 2>/dev/null | grep -F "$tag" | head -1 | awk '{print $1,$2,$3,$4,$5}')
+                    if [ -n "$gsched" ]; then
+                        local t2=/tmp/ct.sync
+                        crontab -l 2>/dev/null | grep -vF "fakeip-cn-auto sync" > "$t2" 2>/dev/null
+                        echo "$gsched /usr/bin/fakeip-cn-auto sync >/dev/null 2>&1" >> "$t2"
+                        crontab "$t2" 2>/dev/null; rm -f "$t2"
+                    fi
+                    pl "${G}  自学习已开启（geosite 主源 + 自学习补漏）${N}"
+                    ;;
+                off)
+                    SELFLEARN=0; _conf_set SELFLEARN 0 || return 1
+                    # 同步移除 crontab 中残留的 fakeip-cn-auto sync 行（否则收集仍在跑）；geosite 主源行保留
+                    local t2=/tmp/ct.sync
+                    crontab -l 2>/dev/null | grep -vF "fakeip-cn-auto sync" > "$t2" 2>/dev/null
+                    crontab "$t2" 2>/dev/null; rm -f "$t2"
+                    pl "${G}  自学习已关闭（仅用社区 geosite 列表, 最省）${N}"
+                    ;;
                 *)   pl "  用法: cc sub-sync selflearn on|off" ;;
             esac
             ;;
