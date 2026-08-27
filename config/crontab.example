@@ -12,5 +12,9 @@
 */10 * * * * /usr/bin/safe-ntp 2>/dev/null
 0 * * * * echo 1 > /proc/sys/vm/drop_caches 2>/dev/null
 */10 * * * * /usr/bin/tune-tolerance.sh >/dev/null 2>&1
+# 国内域名白名单（社区条件下载 + 自学习, 零重启）
+#   手动固定模式: 每日 06:00 更新(避开重启)
+#   自动模式(推荐): cc sub-sync auto 会把下面两行改成与重启事件同频,
+#     例如每3天6:20 reboot → 更新 6:10:  "10 6 */3 * *"
 00 06 * * * /usr/bin/geosite-cn-update >/dev/null 2>&1
 00 06 * * * /usr/bin/fakeip-cn-auto sync >/dev/null 2>&1

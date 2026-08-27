@@ -27,6 +27,7 @@
 | 日志轮转 | `scripts/clash-logrotate` | 5 个日志上限 100KB |
 | 内核调优 | `config/sysctl.conf` | conntrack/min_free/IPv6 禁用 |
 | 配置模板 | `config/config.yaml.example` | 脱敏模板（fake-ip-filter 1022 条国内域名）|
+| 国内域名白名单 | `scripts/geosite-cn-update` + `scripts/fakeip-cn-auto` | **社区列表条件下载 + 自学习补漏**，零重启 |
 
 ---
 
@@ -87,6 +88,8 @@ crontab /tmp/ct.bak
 | `drop_caches` | 每小时 | 内存回收 |
 | `cc.sh sub-update` | 每3天 | 机场订阅更新 |
 | `reboot` | 每3天6:20 | **可选**：定期重启清理内存（不需要可删行）|
+| `geosite-cn-update` | 每3天6:10 | 社区白名单条件下载(零重启, `cc sub-sync auto` 生成) |
+| `fakeip-cn-auto sync` | 每3天6:10 | 自学习收集(零重启, `cc sub-sync auto` 生成) |
 
 ### 4. 修改配置
 ```bash
@@ -116,6 +119,8 @@ cc monitor          # 实时监控
 cc doctor           # 一键诊断
 cc backup           # 备份配置
 cc patch tolerance 120   # 动态改 tolerance(零重启)
+cc sub-sync auto         # 国内白名单自动更新(探测重启事件同频, 零重启)
+cc sub-sync status       # 查看双源白名单/时间策略状态
 ```
 
 完整命令手册见 **[docs/cc命令手册.md](docs/cc命令手册.md)**，排障见 **[docs/部署与排障手册.md](docs/部署与排障手册.md)**。
@@ -123,6 +128,52 @@ cc patch tolerance 120   # 动态改 tolerance(零重启)
 ---
 
 ## ⚙️ 核心机制说明
+
+### 国内域名双源白名单（社区列表 + 自学习，零重启）✨
+
+**为什么**：大陆站点域名被污染时，让它进 `fake-ip-filter` → DNS 返回真实 IP → iptables `cn_ip` 直连，流量**完全不经过代理进程** = 最快、最稳。内核用 trie 按域名 label 分段匹配，加多少条都不慢（实测 5000+ 条 RSS 与不注入持平，内存成本 ≈ 0）。
+
+**双源架构**（`cc sub-sync` 管理）：
+
+```
+主源 = 社区 geosite 列表（别人维护，别人更新我们同步）
+  config/fakeip-cn-geosite.list（v2fly GEOLOCATION-CN 主域 ~4000 条 +.域名）
+  /usr/bin/geosite-cn-update：curl -z 条件下载(If-Modified-Since) + md5 双保险
+    → 检测到没更新就不下载 → 缺失插入 config → 零重启
+
+补充 = 自学习（可选，默认开）
+  /usr/bin/fakeip-cn-auto sync：从 clash connections 动态收集你实际访问的国内域名
+    → 独立存 /etc/clash-rs/fakeip-cn.list → apply 插入 config → 零重启
+```
+
+**社区更新永不丢失自学习**：
+- `geosite-cn-update` 只做**缺失插入**，**从不删除、从不覆盖**已有条目（包括自学习加进去的）
+- 自学习数据独立存在 `/etc/clash-rs/fakeip-cn.list`，社区脚本完全不碰
+- 即使社区上游删掉某条，本机已注入的也保留（宁可多留，不误伤真实用户访问）
+- 两个脚本各自单实例锁，互不干扰
+
+#### 时间策略（三种模式）
+
+| 模式 | 命令 | 行为 |
+|------|------|------|
+| **自动（推荐）** | `cc sub-sync auto [LEAD]` | 扫描 crontab 找「会重启」的事件（reboot / sub-update / clash-rs restart），更新时间 = 事件时刻 − 提前量（默认 10 分钟），**与事件同频**（沿用其日/月/周字段）；无重启事件时退化为每日条件检查（`cc sub-sync auto-daily off` 可关） |
+| **自定义** | `cc sub-sync on HH:MM` | 固定每天 HH:MM 更新，避开重启时间 |
+| **关闭** | `cc sub-sync off` | 移除定时，仅开机检查 + 手动 `cc sub-sync run` |
+
+**自动模式的核心理念：靠近重启，但不主动重启。**
+
+```
+例（crontab.example 默认）：
+  20 6 */3 * * ... reboot        ← 每3天 6:20 重启
+  25 6 */3 * * ... sub-update    ← 每3天 6:25 订阅更新(内容变化会重启 clash-rs)
+
+cc sub-sync auto 10  →  探测到最近生效事件(优先选生效最频繁者) 6:20(reboot)
+  → 更新时间 = 6:20 − 10min = 6:10，cron: 10 6 */3 * * /usr/bin/geosite-cn-update
+  → 6:10 拉最新社区列表（条件下载，没更新不下载，零流量）
+  → 6:20 重启，init.d 顺带应用新白名单 —— 全程零主动重启
+```
+
+**为什么零重启也安全**：`geosite-cn-update` 是条件下载，没更新不下载；每次开机 init.d 也会跑一次条件检查兜底。更新写入 config 后，下一次任意重启/订阅更新都会顺带生效，不会漏。
 
 ### 自适应 tolerance 降级（tune-tolerance.sh）
 节点每 10 分钟测速。连续 N 次不切换 → 自动调低 tolerance 让 AUTO 更敏感：

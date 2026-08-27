@@ -5452,11 +5452,136 @@ _sub_auto_update() {
         esac
     done
 }
-_sub_sync_manager() {
-    local action="${1:-}"
+# ============================================================
+# 国内域名白名单 自动时间模式 (cc sub-sync auto)
+# 逻辑:
+#   1. 扫描 crontab 找"会重启"的事件 (reboot / sub-update / clash-rs restart)
+#   2. 更新时间 = 事件时刻 - LEAD 提前量(默认10分钟), 与事件同频(沿用其 日/月/周 字段)
+#   3. 更新零重启, 生效靠那次重启/订阅更新"顺带"完成, 绝不主动重启
+#   4. 无重启事件: 默认退化为每日(条件下载零成本), 可 DEGRADE_DAILY=0 关闭
+# 用法: cc sub-sync auto [LEAD分钟] / cc sub-sync auto-daily on|off
+# ============================================================
+_conf_set() { # 保留其他键地更新单个键 (动态作用域, 需在 $CONF 已定义的函数内调用)
+    local k="$1" v="$2" tmp
+    # 单引号包裹 + 内部单引号转义：防止值含空格/&&/引号时被 . "$CONF" source 误执行
+    v=$(printf '%s' "$v" | sed "s/'/'\\\\''/g")
+    tmp=$(mktemp /tmp/fk.cnf.XXXXXX 2>/dev/null) || tmp=/tmp/fk.cnf.$$
+    grep -v "^$k=" "$CONF" 2>/dev/null > "$tmp" || : > "$tmp"
+    echo "$k='$v'" >> "$tmp"
+    if ! mv "$tmp" "$CONF" 2>/dev/null; then
+        rm -f "$tmp"
+        pl "${R}  写 $CONF 失败${N}"
+        return 1
+    fi
+    return 0
+}
+
+# 输出匹配的重启事件: "min hour dom mon dow 描述"; 要求 min/hour 为纯数字(去前导0)
+_sub_sync_find_events() {
+    crontab -l 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' | while IFS= read -r cl; do
+        echo "$cl" | grep -qE 'geosite-cn-update|fakeip-cn-auto' && continue
+        echo "$cl" | grep -qE 'sub-update|(^|[^a-zA-Z])reboot|clash-rs (restart|reload)|init.d/clash-rs (restart|reload)' || continue
+        # 注意: @reboot 这类特殊 cron 不含数字时刻, 会被下面 min/hour 数字校验过滤(能力边界),
+        #       如需跟随请用数字时刻的 reboot 行, 如 "20 6 */3 * * /sbin/reboot"
+        # 禁用 glob：cron 行含 * 通配符，set -- 分词前必须关掉路径名展开（否则 */3 * 被展开成文件名）
+        set -f
+        set -- $cl
+        set +f
+        local min=$1 hour=$2 dom=$3 mon=$4 dow=$5
+        echo "$min" | grep -qE '^[0-9]{1,2}$' || continue
+        echo "$hour" | grep -qE '^[0-9]{1,2}$' || continue
+        [ "$min" -le 59 ] 2>/dev/null || continue
+        [ "$hour" -le 23 ] 2>/dev/null || continue
+        # 去前导 0 防八进制（0?* 只剥 05/00 这种，保留单个 0，否则凌晨整点会被清空）
+        case "$min" in 0?*) min=${min#0};; esac
+        case "$hour" in 0?*) hour=${hour#0};; esac
+        local desc
+        desc=$(echo "$cl" | sed 's/^[[:space:]]*[0-9][0-9]*[[:space:]][0-9][0-9]*[[:space:]][^[:space:]]*[[:space:]][^[:space:]]*[[:space:]][^[:space:]]*[[:space:]]*//')
+        echo "$min $hour $dom $mon $dow $desc"
+    done
+}
+
+_sub_sync_auto() {
+    local lead="${1:-10}"
+    # 去前导 0 防八进制（auto 010 应为 10 分钟）
+    case "$lead" in 0?*) lead=${lead#0};; esac
     local CONF=/etc/clash-rs/fakeip-cn-auto.conf
     local tag="geosite-cn-update"
-    local SL=1
+    [ -f "$CONF" ] && . "$CONF" 2>/dev/null
+    : ${SELFLEARN:=1}; : ${DEGRADE_DAILY:=1}
+    echo "$lead" | grep -qE '^[0-9]+$' || { pl "${R}  提前量必须是分钟数 (如 cc sub-sync auto 10)${N}"; return 1; }
+    [ "$lead" -lt 1 ] 2>/dev/null && lead=1
+    [ "$lead" -gt 180 ] 2>/dev/null && lead=180
+
+    # 选事件: 覆盖最频繁(日/月/周尽量多为*)优先, 同覆盖取最早时刻
+    local ev_min="" ev_hour="" ev_dom="" ev_mon="" ev_dow="" ev_desc=""
+    local best_cover=-1 best_min=99999
+    while read -r em eh edom emon edow edesc; do
+        [ -z "$em" ] && continue
+        local cov=0
+        [ "$edom" = "*" ] && cov=$((cov+1))
+        [ "$emon" = "*" ] && cov=$((cov+1))
+        [ "$edow" = "*" ] && cov=$((cov+1))
+        local m=$((eh*60+em))
+        if [ "$cov" -gt "$best_cover" ] || { [ "$cov" -eq "$best_cover" ] && [ "$m" -lt "$best_min" ]; }; then
+            best_cover=$cov; best_min=$m
+            ev_min=$em; ev_hour=$eh; ev_dom=$edom; ev_mon=$emon; ev_dow=$edow; ev_desc="$edesc"
+        fi
+    done <<EOF
+$(_sub_sync_find_events)
+EOF
+
+    local upd_min upd_hour sched_dom sched_mon sched_dow mode_desc
+    if [ -n "$ev_min" ]; then
+        local ev_total=$((ev_hour*60+ev_min))
+        local upd_total=$((ev_total-lead)) crossed=0
+        [ "$upd_total" -lt 0 ] && { upd_total=$((upd_total+1440)); crossed=1; }
+        upd_hour=$((upd_total/60)); upd_min=$((upd_total%60))
+        if [ "$crossed" = "1" ]; then
+            sched_dom="*"; sched_mon="*"; sched_dow="*"   # 跨天无法简单退日期, 改每日
+        else
+            sched_dom="$ev_dom"; sched_mon="$ev_mon"; sched_dow="$ev_dow"
+        fi
+        local evh=$(printf '%02d' "$ev_hour") evm=$(printf '%02d' "$ev_min")
+        mode_desc="同频重启事件 $(echo "$ev_desc" | cut -c1-40) (${evh}:${evm}), 提前 ${lead} 分钟"
+        [ "$crossed" = "1" ] && mode_desc="$mode_desc (跨天, 退化为每日)"
+    elif [ "$DEGRADE_DAILY" = "1" ]; then
+        local upd_total=$((360-lead)); [ "$upd_total" -lt 0 ] && upd_total=0
+        upd_hour=$((upd_total/60)); upd_min=$((upd_total%60))
+        sched_dom="*"; sched_mon="*"; sched_dow="*"
+        mode_desc="未发现重启事件, 退化每日 (条件下载零成本)"
+    else
+        pl "${R}  未发现重启事件且已关闭每日退化, 请用 cc sub-sync on HH:MM 自定义${N}"
+        return 1
+    fi
+
+    local sched="$upd_min $upd_hour $sched_dom $sched_mon $sched_dow"
+    local t2=/tmp/ct.sync
+    crontab -l 2>/dev/null | grep -vF "$tag" | grep -vF "fakeip-cn-auto sync" > "$t2" 2>/dev/null
+    echo "$sched /usr/bin/geosite-cn-update >/dev/null 2>&1" >> "$t2"
+    if [ "$SELFLEARN" = "1" ]; then
+        echo "$sched /usr/bin/fakeip-cn-auto sync >/dev/null 2>&1" >> "$t2"
+    fi
+    if ! crontab "$t2" 2>/dev/null; then
+        pl "${R}  写 crontab 失败（内存不足/磁盘满?）${N}"
+        rm -f "$t2"
+        return 1
+    fi
+    rm -f "$t2"
+    for kv in "SELFLEARN=$SELFLEARN" "MODE=auto" "LEAD=$lead" "DEGRADE_DAILY=$DEGRADE_DAILY" "EVENT=${ev_desc:-每日退化}" "UPD_SCHED=$sched"; do
+        _conf_set "${kv%%=*}" "${kv#*=}" || return 1
+    done
+    local uph=$(printf '%02d' "$upd_hour") upm=$(printf '%02d' "$upd_min")
+    pl "${G}  已开启自动模式${N}: $mode_desc"
+    pl "  调度: ${uph}:${upm} ${sched_dom} ${sched_mon} ${sched_dow}  geosite-cn-update(+自学习)"
+    pl "  生效: 零重启; 由那次重启/订阅更新顺带应用; 每次开机 init.d 也会条件检查"
+}
+
+_sub_sync_manager() {
+    local action="${1:-}"
+    local arg2="${2:-}"
+    local CONF=/etc/clash-rs/fakeip-cn-auto.conf
+    local tag="geosite-cn-update"
     [ -f "$CONF" ] && . "$CONF" 2>/dev/null
     : ${SELFLEARN:=1}
     case "$action" in
@@ -5475,7 +5600,7 @@ _sub_sync_manager() {
             pl "${G}  完成（零重启，重启/订阅更新时生效）${N}"
             ;;
         set|on)
-            local t="${2:-06:00}"
+            local t="${arg2:-06:00}"
             if ! echo "$t" | grep -qE '^[0-9]{1,2}:[0-9]{2}$'; then
                 pl "${R}  时间格式 HH:MM (如 06:00)${N}"; return 1
             fi
@@ -5490,18 +5615,43 @@ _sub_sync_manager() {
             if [ "$SELFLEARN" = "1" ]; then
                 echo "$sched /usr/bin/fakeip-cn-auto sync >/dev/null 2>&1" >> "$t2"
             fi
-            crontab "$t2" 2>/dev/null; rm -f "$t2"
-            pl "${G}  已设每日 ${t} 定时更新${N}（geosite 社区列表条件下载+自学习, 避开重启, 零重启影响最小）"
+            if ! crontab "$t2" 2>/dev/null; then
+                pl "${R}  写 crontab 失败（内存不足/磁盘满?）${N}"
+                rm -f "$t2"
+                return 1
+            fi
+            rm -f "$t2"
+            _conf_set MODE fixed || return 1
+            _conf_set FIXED_TIME "$t" || return 1
+            pl "${G}  已设每日 ${t} 定时更新${N}（自定义模式, geosite 社区列表条件下载+自学习, 避开重启, 零重启影响最小）"
             ;;
         off)
-            crontab -l 2>/dev/null | grep -vF "$tag" | grep -vF "fakeip-cn-auto sync" | crontab - 2>/dev/null
+            local t2=/tmp/ct.sync
+            crontab -l 2>/dev/null | grep -vF "$tag" | grep -vF "fakeip-cn-auto sync" > "$t2" 2>/dev/null
+            if ! crontab "$t2" 2>/dev/null; then
+                pl "${R}  写 crontab 失败（内存不足/磁盘满?）${N}"
+                rm -f "$t2"
+                return 1
+            fi
+            rm -f "$t2"
+            _conf_set MODE off || return 1
             pl "${G}  已关闭定时更新${N}"
             ;;
         selflearn)
-            case "${2:-}" in
-                on)  SELFLEARN=1; echo "SELFLEARN=1" > "$CONF"; pl "${G}  自学习已开启（geosite 主源 + 自学习补漏）${N}" ;;
-                off) SELFLEARN=0; echo "SELFLEARN=0" > "$CONF"; pl "${G}  自学习已关闭（仅用社区 geosite 列表, 最省）${N}" ;;
+            case "$arg2" in
+                on)  SELFLEARN=1; _conf_set SELFLEARN 1 || return 1; pl "${G}  自学习已开启（geosite 主源 + 自学习补漏）${N}" ;;
+                off) SELFLEARN=0; _conf_set SELFLEARN 0 || return 1; pl "${G}  自学习已关闭（仅用社区 geosite 列表, 最省）${N}" ;;
                 *)   pl "  用法: cc sub-sync selflearn on|off" ;;
+            esac
+            ;;
+        auto)
+            _sub_sync_auto "${arg2:-10}"
+            ;;
+        auto-daily)
+            case "$arg2" in
+                on)  DEGRADE_DAILY=1; _conf_set DEGRADE_DAILY 1 || return 1; pl "${G}  每日退化已开${N}（无重启事件时每日条件检查）" ;;
+                off) DEGRADE_DAILY=0; _conf_set DEGRADE_DAILY 0 || return 1; pl "${G}  每日退化已关${N}（无重启事件时不做每日更新）" ;;
+                *)   pl "  用法: cc sub-sync auto-daily on|off" ;;
             esac
             ;;
         status)
@@ -5509,6 +5659,16 @@ _sub_sync_manager() {
             local gs=$(wc -l < /etc/clash-rs/fakeip-cn-geosite.list 2>/dev/null || echo 0)
             local cf=$(grep -c "'+" /etc/clash-rs/config.yaml 2>/dev/null)
             local lu=$(tail -1 /var/log/geosite-cn-update.log 2>/dev/null)
+            local MD=""
+            [ -f "$CONF" ] && . "$CONF" 2>/dev/null
+            case "${MODE:-}" in
+                auto)  MD="自动(同频重启事件)"; [ -n "$LEAD" ] && MD="$MD, 提前${LEAD}分钟" ;;
+                fixed) MD="自定义每日 ${FIXED_TIME:-06:00}" ;;
+                *)     MD="未设置定时" ;;
+            esac
+            pl "  模式: $MD"
+            [ -n "${EVENT:-}" ] && pl "  依据事件: $EVENT"
+            [ -n "${UPD_SCHED:-}" ] && pl "  调度 cron: $UPD_SCHED /usr/bin/geosite-cn-update"
             pl "  社区列表(geosite): $gs 条 +.域名"
             pl "  自学习: $([ "$SELFLEARN" = 1 ] && echo '开' || echo '关')"
             pl "  config 白名单: $cf 条"
@@ -5518,11 +5678,13 @@ _sub_sync_manager() {
         *)
             pl "${C}  国内域名白名单管理${N}（主源=社区 geosite 列表, 检测没更新不下载; 补充=自学习可选）"
             pl "  ${Y}cc sub-sync run${N}            立即更新(条件下载+自学习, 零重启)"
-            pl "  ${Y}cc sub-sync on [HH:MM]${N}     定时更新, 默认06:00(订阅前30分, 避开06:20重启)"
+            pl "  ${Y}cc sub-sync auto [LEAD]${N}    自动: 探测重启事件同频调度, 提前LEAD分钟(默认10); 无事件退化每日"
+            pl "  ${Y}cc sub-sync auto-daily on|off${N}  无重启事件时是否退化为每日(默认开)"
+            pl "  ${Y}cc sub-sync on [HH:MM]${N}     自定义定时更新, 默认06:00(订阅前30分, 避开06:20重启)"
             pl "  ${Y}cc sub-sync off${N}            关闭定时"
             pl "  ${Y}cc sub-sync selflearn on|off${N}  自学习开关(默认开)"
             pl "  ${Y}cc sub-sync status${N}         状态"
-            pl "  ${W}说明:${N} geosite 列表(别人维护)更新时, 条件请求检测到没变就不下载, 零重启影响最小"
+            pl "  ${W}说明:${N} geosite 列表(别人维护)更新时, 条件请求检测到没变就不下载, 零重启影响最小; 自动模式不主动重启, 靠重启/订阅更新顺带生效"
             ;;
     esac
 }

@@ -69,6 +69,41 @@ cc test auto
 
 > ⚠️ 自动订阅更新默认每 3 天一次（crontab），可在 `cc profile` 中调整频率或关闭。
 
+### 国内域名白名单（cc sub-sync）
+
+**双源架构**：主源 = 社区 geosite 列表（`geosite-cn-update` 条件下载，别人维护我们同步）；补充 = 自学习（`fakeip-cn-auto` 从 clash connections 动态收集你实际访问的国内域名，可选默认开）。两者都**零重启**写入 `fake-ip-filter`，让国内域名 DNS 返回真实 IP 直连，**不经过代理进程** = 最快、最稳，内存成本 ≈ 0。
+
+| 命令 | 作用 |
+|------|------|
+| `cc sub-sync run` | 立即更新（geosite 条件下载 + 自学习，零重启）|
+| `cc sub-sync auto [LEAD]` | **自动时间（推荐）**：探测 crontab 中会重启的事件，更新时间 = 事件时刻 − 提前量（默认 10 分钟），与事件同频；无事件退化为每日 |
+| `cc sub-sync auto-daily on\|off` | 无重启事件时是否退化为每日条件检查（默认开）|
+| `cc sub-sync on [HH:MM]` | 自定义固定时间（默认 06:00）|
+| `cc sub-sync off` | 关闭定时 |
+| `cc sub-sync selflearn on\|off` | 自学习开关（默认开）|
+| `cc sub-sync status` | 查看模式 / 依据事件 / 调度 / 条数 |
+
+**自动模式详解（靠近重启，但不主动重启）**：
+
+```
+1. 扫描 crontab 找「会重启」的事件行：reboot / sub-update / clash-rs restart
+2. 优先选「生效最频繁」的事件（日/月/周字段尽量多为 *），同频取最早时刻
+3. 更新时间 = 事件时刻 − LEAD（默认10分钟），沿用事件的日/月/周字段（同频）
+4. 更新零重启；由那次重启/订阅更新顺带应用，绝不主动重启
+5. 无重启事件：退化为每日条件检查（`auto-daily off` 可关）
+```
+
+**社区更新永不丢失自学习**：`geosite-cn-update` 只做缺失插入、**从不删除/覆盖**；自学习独立存 `/etc/clash-rs/fakeip-cn.list`，两个脚本互不触碰。即使社区上游删掉某条，本机已注入的也保留。
+
+```bash
+# 自动模式（跟随 6:20 reboot，提前10分钟即 6:10 更新）
+cc sub-sync auto
+# 自定义每天 03:30
+cc sub-sync on 03:30
+# 查看状态
+cc sub-sync status
+```
+
 ---
 
 ## 四、性能调优
@@ -190,6 +225,8 @@ cc patch interval 300
 | clash-logrotate | 每10分钟 | 日志轮转（上限100KB）|
 | drop_caches | 每小时 | 内存清理 |
 | cc.sh sub-update | 每3天 | 订阅更新 |
+| geosite-cn-update | 每3天6:10 | 社区白名单条件下载(零重启, `cc sub-sync auto` 生成) |
+| fakeip-cn-auto sync | 每3天6:10 | 自学习收集(零重启, `cc sub-sync auto` 生成) |
 
 检查当前任务：
 ```bash
