@@ -5732,6 +5732,38 @@ _sub_sync_manager() {
 }
 
 
+_reboot_coming_soon() {
+    # 判断"今天是否有即将到来的 reboot（可借力顺带生效）"。
+    # 返回 0 = 今天有 reboot 且其时刻晚于当前（sub-update 跑完后 reboot 会顺带应用, 不必单独重启）
+    # 返回 1 = 无 reboot / reboot 已过 / 无法解析（需单独重启生效）
+    local line dom d hh mm n
+    line=$(crontab -l 2>/dev/null | grep 'reboot' | grep -vE 'geosite-cn-update|fakeip-cn-auto|sub-update' | head -1)
+    [ -z "$line" ] && return 1
+    dom=$(echo "$line" | awk '{print $3}')
+    hh=$(echo "$line" | awk '{print $2}'); case "$hh" in 0?*) hh=${hh#0};; esac
+    mm=$(echo "$line" | awk '{print $1}'); case "$mm" in 0?*) mm=${mm#0};; esac
+    d=$(date +%d); case "$d" in 0?*) d=${d#0};; esac
+    case "$dom" in
+        \*) ;;
+        \*/[0-9]*)
+            n=${dom#*/}
+            # busybox crond 的 */n = field % n == 0 才触发
+            [ $((d % n)) -ne 0 ] 2>/dev/null && return 1
+            ;;
+        [0-9]*)
+            [ "$d" -ne "$dom" ] 2>/dev/null && return 1
+            ;;
+        *) return 1 ;;
+    esac
+    # reboot 时刻必须晚于当前时刻（还没发生）才可借
+    local nh=$(date +%H); case "$nh" in 0?*) nh=${nh#0};; esac
+    local nm=$(date +%M); case "$nm" in 0?*) nm=${nm#0};; esac
+    local reboot_min=$((hh*60+mm)) now_min=$((nh*60+nm))
+    [ "$reboot_min" -le "$now_min" ] && return 1
+    return 0
+}
+
+
 _sub_update_all() {
     local subfile='/etc/clash-rs/subscriptions.list'
     [ ! -s "$subfile" ] && { pl "${R}  无订阅${N}"; return 1; }
@@ -5830,6 +5862,253 @@ $new_line"
     rm -f "$allnodes"
 }
 
+
+
+show_menu() {
+    while true; do
+        # 获取运行状态
+        if is_running; then
+            PID=$(get_pid)
+            RSS=$(get_rss)
+            PROXY=$(get_proxy_now)
+            UPTIME=$(get_uptime)
+            run_status="${G}正在运行${N}"
+            mem_info="内存:${G}${RSS}MB${N}"
+            node_info="节点:${G}${PROXY:-未知}${N}"
+            time_info="运行:${G}${UPTIME}${N}"
+        else
+            run_status="${R}没有运行${N}"
+            mem_info=""
+            node_info=""
+            time_info=""
+        fi
+
+        # 开机自启检测
+        if ls /etc/rc.d/S*clash-rs >/dev/null 2>&1; then
+            auto_info="${G}已设置开机启动${N}"
+        else
+            auto_info="${R}未设置开机启动${N}"
+        fi
+
+        printf "\n"
+        line
+        pl "${W}  欢迎使用 clash-rs 管理面板！${N}"
+        line
+        pl "  clash-rs服务${run_status}，${auto_info}"
+        if is_running; then
+            pl "  当前${mem_info}，已${time_info}"
+            pl "  当前${node_info}"
+            # 路由器开机时间
+            if [ -f /proc/uptime ]; then
+                local sec=$(cat /proc/uptime | awk '{print int($1)}')
+                local day=$((sec / 86400))
+                local hour=$(( (sec % 86400) / 3600 ))
+                local min=$(( (sec % 3600) / 60 ))
+                local router_up=""
+                [ "$day" -gt 0 ] && router_up="${day}天"
+                router_up="${router_up}${hour}时${min}分"
+                local boot_time=$(date -d "@$(($(date +%s) - sec))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+                pl "  路由器: ${router_up} (开机: ${boot_time})"
+            fi
+            NH_VAL=$(cat $NODE_HEALTH_FILE 2>/dev/null)
+            if [ "$NH_VAL" = "1" ]; then
+                pl "  节点健康检查:${G}开${N} (每60秒自动切换故障节点)"
+            fi
+        fi
+        line
+        pl "  ${G}1${N} 启动/重启服务"
+        pl "  ${C}2${N} 功能设置"
+        pl "  ${R}3${N} 停止服务"
+        pl "  ${Y}4${N} 版本与信息"
+        pl "  ${W}5${N} 切换节点"
+        pl "  ${W}6${N} 测试延迟"
+        pl "  ${W}7${N} 实时监控"
+        pl "  ${W}8${N} 查看日志"
+        pl "  ${W}9${N} 清理内存"
+        pl "  ${W}10${N} 网络测试"
+        pl "  ${W}11${N} 面板地址"
+        pl "  ${W}12${N} 进程资源"
+        pl "  ${W}13${N} 网速测试"
+        pl "  ${W}14${N} 活跃连接"
+        pl "  ${W}15${N} 节点管理"
+        pl "  ${W}16${N} 一键诊断"
+        pl "  ${W}17${N} 系统信息"
+        pl "  ${W}18${N} NSS加速状态"
+        pl "  ${W}19${N} 备份与回滚"
+        pl "  ${W}20${N} 高级调优 (缓冲区/CPU/conntrack/MTU)"
+        pl "  ${W}21${N} 配置管理 (热改/TUN/DNS/Profile)"
+        pl "  ${W}22${N} API查询 (规则/流向/连接/订阅)"
+        pl "  ${W}23${N} clash-rs核心配置 (API/UI/GeoIP/interface)"
+pl "  ${W}24${N} 订阅管理 (cc sub)"
+        line
+        pl "  ${W}0${N} 退出脚本"
+        line
+        printf "  请输入对应数字 > "
+        read choice
+
+        case $choice in
+            1) do_restart; sleep 1 ;;
+            2) show_settings ;;
+            3) do_stop; sleep 1 ;;
+            4) show_version; pause_for_input ;;
+            5) do_switch; pause_for_input ;;
+            6)
+                # 测试延迟: 子菜单选择 PROXY/AUTO 组
+                printf "  ${Y}测试哪个组? [1]PROXY [2]AUTO (回车=PROXY): ${N}"
+                read tgrp
+                case "$tgrp" in
+                    2) do_test --auto ;;
+                    *) do_test ;;
+                esac
+                pause_for_input ;;
+            7) do_monitor ;;
+            8) do_log; pause_for_input ;;
+            9) do_flush; pause_for_input ;;
+            10) do_nettest; pause_for_input ;;
+            11)
+                host=$(ip a 2>/dev/null | grep -w 'inet' | grep 'global' | grep -E ' 1(92|0|72)\.' | sed 's/.*inet.//g' | sed 's/\/[0-9].*$//g' | head -n 1)
+                [ -z "$host" ] && host="192.168.10.1"
+                pl "${G}  面板地址: http://${host}:9090/ui${N}"
+                pl "  API密钥: clashrs2026"
+                pl "  在线面板: https://d.metacubex.one"
+                ;;
+            12) do_top; pause_for_input ;;
+            13) do_speed; pause_for_input ;;
+            14) do_conn; pause_for_input ;;
+            15) do_node_menu ;;
+            16) do_doctor; pause_for_input ;;
+            17) do_sysinfo; pause_for_input ;;
+            18) do_nss; pause_for_input ;;
+            19)
+                # 备份与回滚子菜单
+                while true; do
+                    printf "\n"
+                    line
+                    pl "${C}  备份与回滚${N}"
+                    line
+                    pl "  ${W}1${N}. 立即备份当前配置"
+                    pl "  ${W}2${N}. 查看备份列表"
+                    pl "  ${W}3${N}. 从备份恢复"
+                    pl "  ${W}4${N}. 备份二进制"
+                    pl "  ${W}5${N}. 查看二进制备份"
+                    pl "  ${W}6${N}. 从二进制备份恢复"
+                    pl "  ${W}7${N}. 二进制版本详情"
+                    pl "  ${W}0${N}. 返回上级菜单"
+                    printf "\n  请选择: "
+                    read bk_choice
+                    case "$bk_choice" in
+                        1) _backup_create; pause_for_input ;;
+                        2) _backup_list; pause_for_input ;;
+                        3) _backup_restore; pause_for_input ;;
+                        4) _binbak_create; pause_for_input ;;
+                        5) _binbak_list; pause_for_input ;;
+                        6) _binbak_restore; pause_for_input ;;
+                        7) do_binver; pause_for_input ;;
+                        0) break ;;
+                        *) pl "${R}  无效选择${N}" ;;
+                    esac
+                done
+                ;;
+            20) do_tune ;;
+            21)
+                # 配置管理子菜单
+                while true; do
+                    printf "\n"
+                    line
+                    pl "${C}  配置管理 (热修改/子菜单)${N}"
+                    line
+                    pl "  ${W}1${N}. 查看运行时配置 (cc apiconf)"
+                    pl "  ${W}2${N}. 热改字段 (cc patch)"
+                    pl "  ${W}3${N}. TUN配置子菜单"
+                    pl "  ${W}4${N}. DNS配置子菜单"
+                    pl "  ${W}5${N}. Profile持久化子菜单"
+                    pl "  ${W}6${N}. 完整设置菜单 (端口/IPv6/log-level/experimental)"
+                    pl "  ${W}7${N}. clash-rs核心配置 (API/UI/GeoIP/interface)"
+                    pl "  ${W}8${N}. AUTO组配置 (tolerance/interval/强制切换)"
+                    pl "  ${W}0${N}. 返回上级菜单"
+                    printf "\n  请选择: "
+                    read cfg_choice
+                    case "$cfg_choice" in
+                        1) do_apiconf; pause_for_input ;;
+                        2)
+                            printf "  字段名 (如 port/mode/ipv6/allow-lan/log-level): "; read pf
+                            printf "  新值: "; read pv
+                            do_patch "$pf" "$pv"
+                            pause_for_input
+                            ;;
+                        3) do_tun ;;
+                        4) do_dns_conf ;;
+                        5) do_profile ;;
+                        6) show_settings ;;
+                        7) do_clash_conf ;;
+                        8) do_autogroup ;;
+                        0) break ;;
+                        *) pl "${R}  无效选择${N}" ;;
+                    esac
+                done
+                ;;
+            22)
+                # API查询子菜单
+                while true; do
+                    printf "\n"
+                    line
+                    pl "${C}  API查询 (规则/流向/连接/订阅)${N}"
+                    line
+                    pl "  ${W}1${N}. 查看路由规则 (cc rules)"
+                    pl "  ${W}2${N}. 流量流向 TOP (cc flows)"
+                    pl "  ${W}3${N}. 活跃连接 (cc conn)"
+                    pl "  ${W}4${N}. 关闭连接 (cc conns kill)"
+                    pl "  ${W}5${N}. 订阅/规则集管理 (cc provider)"
+                    pl "  ${W}6${N}. DNS解析测试 (cc dns-query)"
+                    pl "  ${W}0${N}. 返回上级菜单"
+                    printf "\n  请选择: "
+                    read api_choice
+                    case "$api_choice" in
+                        1)
+                            printf "  显示条数 (回车=50): "; read rl
+                            do_rules "$rl"
+                            pause_for_input
+                            ;;
+                        2)
+                            printf "  TOP数 (回车=15): "; read fl
+                            do_flows "$fl"
+                            pause_for_input
+                            ;;
+                        3) do_conn; pause_for_input ;;
+                        4)
+                            printf "  连接ID或all: "; read cid
+                            do_conns_kill "$cid"
+                            pause_for_input
+                            ;;
+                        5)
+                            printf "  操作 (list/update, 回车=list): "; read pa_op
+                            if [ "$pa_op" = "update" ]; then
+                                printf "  名称 (或all): "; read pa_name
+                                do_provider update "$pa_name"
+                            else
+                                do_provider list
+                            fi
+                            pause_for_input
+                            ;;
+                        6)
+                            printf "  域名: "; read dn
+                            printf "  类型 (A/AAAA/CNAME/MX, 默认A): "; read dt
+                            [ -z "$dt" ] && dt="A"
+                            do_dns_query "$dn" "$dt"
+                            pause_for_input
+                            ;;
+                        0) break ;;
+                        *) pl "${R}  无效选择${N}" ;;
+                    esac
+                done
+                ;;
+            23) do_clash_conf ;;
+    24) sh /etc/clash-rs/cc.sh sub; pause_for_input ;;
+            0) printf "\n"; exit 0 ;;
+            *) pl "${R}  请输入正确的数字！${N}" ;;
+        esac
+    done
+}
 
 case "$1" in
     start)    do_start ;;
