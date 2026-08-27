@@ -5047,7 +5047,8 @@ _sub_update() {
         local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
         [ -z "$decoded" ] && decoded="$name"
         echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
-        local new_line=$(name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
+        local new_line=$(printf '%s
+' "$line" | name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
         [ -z "$new_line" ] && new_line="$line"
         # 去重：节点名已在列表则跳过（防止 duplicated proxy name 崩溃）
         echo "$node_names" | grep -Fqx "$decoded" && continue
@@ -5136,7 +5137,8 @@ _sub_update_one() {
         local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
         [ -z "$decoded" ] && decoded="$name"
         echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
-        local new_line=$(name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
+        local new_line=$(printf '%s
+' "$line" | name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
         [ -z "$new_line" ] && new_line="$line"
         echo "$node_names" | grep -Fqx "$decoded" && continue
         node_names="$node_names
@@ -5805,7 +5807,8 @@ _sub_update_all() {
         local decoded=$(printf "%b" "$(echo "$name" | sed 's/%/\\\\x/g')" 2>/dev/null)
         [ -z "$decoded" ] && decoded="$name"
         echo "$decoded" | grep -qE '剩余|到期|重置|套餐|GB|天' && continue
-        local new_line=$(name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
+        local new_line=$(printf '%s
+' "$line" | name="$name" decoded="$decoded" awk 'BEGIN{a="name: \"" ENVIRON["name"] "\""; b="name: \"" ENVIRON["decoded"] "\""} {i=index($0,a); if(i>0){print substr($0,1,i-1) b substr($0,i+length(a))} else print}' 2>/dev/null)
         [ -z "$new_line" ] && new_line="$line"
         # 去重：节点名已在列表则跳过（防止 duplicated proxy name 崩溃）
         echo "$node_names" | grep -Fqx "$decoded" && continue
