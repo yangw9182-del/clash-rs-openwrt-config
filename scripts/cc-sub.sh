@@ -4927,6 +4927,7 @@ _sub_menu() {
         pl "  ${W}4${N}. 删除订阅"
         pl "  ${W}5${N}. 导入单节点"
         pl "  ${W}6${N}. 自动更新设置"
+        pl "  ${W}7${N}. 国内域名同步"
         pl "  ${W}0${N}. 返回"
         line
         printf '\n  选择: '
@@ -4938,6 +4939,7 @@ _sub_menu() {
             4) _sub_del ;;
             5) _sub_single_input ;;
             6) _sub_auto_update ;;
+            7) _sub_sync_manager ;;
             0) break ;;
             *) pl "${R}  无效${N}" ;;
         esac
@@ -5450,6 +5452,56 @@ _sub_auto_update() {
         esac
     done
 }
+_sub_sync_manager() {
+    local action="${1:-}"
+    local tag="fakeip-cn-auto sync"
+    case "$action" in
+        run)
+            [ -x /usr/bin/fakeip-cn-auto ] || { pl "${R}  缺少 fakeip-cn-auto${N}"; return 1; }
+            pl "${C}  同步国内域名（自学习→判大陆→写列表, 零重启）...${N}"
+            /usr/bin/fakeip-cn-auto sync
+            /usr/bin/fakeip-cn-auto apply
+            local n=$(wc -l < /etc/clash-rs/fakeip-cn.list 2>/dev/null || echo 0)
+            pl "${G}  完成: 已收集 $n 条, 已应用(下次重启/订阅更新生效)${N}"
+            ;;
+        set|on)
+            local t="${2:-06:00}"
+            if ! echo "$t" | grep -qE '^[0-9]{1,2}:[0-9]{2}$'; then
+                pl "${R}  时间格式 HH:MM (如 06:00)${N}"; return 1
+            fi
+            local hh=$(echo "$t" | cut -d: -f1); local mm=$(echo "$t" | cut -d: -f2)
+            if [ "$hh" -gt 23 ] 2>/dev/null || [ "$mm" -gt 59 ] 2>/dev/null; then
+                pl "${R}  时间范围: 小时0-23 分钟0-59${N}"; return 1
+            fi
+            local sched="$mm $hh * * *"
+            local t2=/tmp/ct.sync
+            crontab -l 2>/dev/null | grep -vF "$tag" > "$t2" 2>/dev/null
+            echo "$sched /usr/bin/fakeip-cn-auto sync >/dev/null 2>&1" >> "$t2"
+            crontab "$t2" 2>/dev/null; rm -f "$t2"
+            pl "${G}  已设每日 ${t} 自动同步${N}（推荐 06:00=订阅更新前30分、避开06:20重启, 零重启影响最小）"
+            ;;
+        off)
+            crontab -l 2>/dev/null | grep -vF "$tag" | crontab - 2>/dev/null
+            pl "${G}  已关闭定时同步${N}"
+            ;;
+        status)
+            local sched=$(crontab -l 2>/dev/null | grep -F "$tag" | head -1)
+            local n=$(wc -l < /etc/clash-rs/fakeip-cn.list 2>/dev/null || echo 0)
+            local cf=$(grep -c "'+" /etc/clash-rs/config.yaml 2>/dev/null)
+            pl "  定时调度: ${sched:-未设置}"
+            pl "  已收集域名(list): $n 条"
+            pl "  config 白名单总数: $cf 条"
+            ;;
+        *)
+            pl "${C}  国内域名同步管理${N}（自学习: clash连接→国内DNS解析→cn_ip判大陆→白名单直连）"
+            pl "  ${Y}cc sub-sync run${N}         立即同步(收集+应用, 零重启)"
+            pl "  ${Y}cc sub-sync on [HH:MM]${N}   定时同步, 默认06:00(订阅前30分, 避开重启)"
+            pl "  ${Y}cc sub-sync off${N}          关闭定时"
+            pl "  ${Y}cc sub-sync status${N}       查看调度/列表状态"
+            ;;
+    esac
+}
+
 
 _sub_update_all() {
     local subfile='/etc/clash-rs/subscriptions.list'
@@ -5596,6 +5648,7 @@ case "$1" in
     sub) _do_sub_import "$1" ;;
     sub-update) _sub_update_all ;;
     sub-auto) _sub_auto_update "$2" ;;
+    sub-sync) _sub_sync_manager "$2" ;;
     dns)
         # cc dns 进入DNS子菜单; cc dns-query <domain> 是DNS测试
         if [ -z "$2" ]; then do_dns_conf
