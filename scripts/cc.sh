@@ -3799,7 +3799,8 @@ do_autogroup() {
                 echo "$auto_nodes" | while read n; do
                     [ -z "$n" ] && continue
                     local d
-d=$(echo "$all_resp" | n="$n" awk '{
+# 假设: 节点对象内无嵌套 {} (当前 /proxies 响应 flat, history 内 delay 对象闭合于首个 })
+    d=$(echo "$all_resp" | n="$n" awk '{
     k = "\"" ENVIRON["n"] "\":{"
     i = index($0, k)
     if (i <= 0) next

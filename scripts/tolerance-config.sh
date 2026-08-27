@@ -137,7 +137,7 @@ _edit_level() {
     echo "  数字越大越不容易切换节点（越稳定）"
     echo "  数字越小越容易切换节点（越敏感）"
     echo "  建议范围: 10~100ms"
-    echo "  举例: 50ms 表示当前节点比最优节点慢 50ms 以内就不切换"
+    echo "  举例: 60ms 表示当前节点比最优节点慢 60ms 以内就不切换"
     printf "  输入新值 [回车保持 ${cur_tol}]: "
     read -r new_tol
     [ -n "$new_tol" ] && cur_tol=$new_tol

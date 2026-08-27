@@ -3741,7 +3741,8 @@ do_autogroup() {
                 echo "$auto_nodes" | while read n; do
                     [ -z "$n" ] && continue
                     local d
-d=$(echo "$all_resp" | n="$n" awk '{
+# 假设: 节点对象内无嵌套 {} (当前 /proxies 响应 flat, history 内 delay 对象闭合于首个 })
+    d=$(echo "$all_resp" | n="$n" awk '{
     k = "\"" ENVIRON["n"] "\":{"
     i = index($0, k)
     if (i <= 0) next
@@ -5296,8 +5297,9 @@ _sub_del() {
         ''|*[!0-9]*) pl "${R}  无效序号${N}"; return 1 ;;
     esac
     # 防超长数字: busybox [ -lt ] 对超长整数报 Illegal number 且错误被吞, 会绕过范围检查
-    [ "${#choice}" -gt 10 ] && { pl "${R}  无效序号${N}"; return 1; }
     local total=$(grep -cE '.' "$_subfile")
+    # 合法的序号位数不可能超过 total 的位数（比固定阈值更稳，兼容 32 位 int busybox）
+    [ "${#choice}" -gt "${#total}" ] && { pl "${R}  无效序号${N}"; return 1; }
     if [ "$choice" -lt 1 ] || [ "$choice" -gt "$total" ] 2>/dev/null; then
         pl "${R}  序号超出范围 (1-$total)${N}"; return 1
     fi
