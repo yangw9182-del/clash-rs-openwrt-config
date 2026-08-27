@@ -5450,6 +5450,8 @@ _sub_update_all() {
 
     # 备份
     cp "$CONFIG" "$CONFIG.bak.sub.$(date +%s)" 2>/dev/null
+    # 清理旧备份，只保留最近 3 个（防止 sub-update 每日累积占满磁盘）
+    ls -t $CONFIG.bak.sub.* 2>/dev/null | tail -n +4 | xargs -r rm -f 2>/dev/null
 
     # 解析节点（URL解码+过滤）
     local node_names=""
