@@ -1,0 +1,77 @@
+#!/bin/sh
+# ============================================================
+# geosite-cn-update - 国内域名白名单更新（社区维护，条件下载）
+# 来源: 配置仓库 config/fakeip-cn-geosite.list
+#       （由 v2fly geosite GEOLOCATION-CN 编译，社区持续更新，别人更新了我们同步）
+# 特性:
+#   - 条件下载(If-Modified-Since)：检测到没更新就不下载
+#   - md5 双保险：内容相同不更新
+#   - 零重启注入：只改 config 文件，下次启动/订阅更新生效
+# 用法: geosite-cn-update [--force]      (--force 忽略缓存强制下载)
+# 日志: /var/log/geosite-cn-update.log
+# ============================================================
+CONFIG=/etc/clash-rs/config.yaml
+CACHE=/etc/clash-rs/fakeip-cn-geosite.list
+URL="https://raw.githubusercontent.com/yangw9182-del/clash-rs-openwrt-config/master/config/fakeip-cn-geosite.list"
+LOCK=/tmp/geosite-cn-update.lock
+LOG=/var/log/geosite-cn-update.log
+TMP=/tmp/_geosite.new
+PROXY=""
+FORCE="$1"
+
+# 单实例锁
+[ -f "$LOCK" ] && [ -d "/proc/$(cat $LOCK 2>/dev/null)" ] && exit 0
+echo $$ > "$LOCK"
+trap "rm -f $LOCK" EXIT
+
+# 走 clash 代理（常态在跑）；start 时 clash 未起则快速失败，容忍
+if curl -s --connect-timeout 2 -o /dev/null http://127.0.0.1:7890 2>/dev/null; then
+    PROXY="-x http://127.0.0.1:7890"
+fi
+
+# 1. 条件下载：-z 用缓存文件时间对比服务器 Last-Modified，未更新则返回空(304)不下载
+if [ "$FORCE" = "--force" ] && [ -f "$CACHE" ]; then
+    curl -s $PROXY --connect-timeout 8 --max-time 90 "$URL" -o "$TMP" 2>/dev/null
+elif [ -f "$CACHE" ]; then
+    curl -s $PROXY -z "$CACHE" --connect-timeout 8 --max-time 90 "$URL" -o "$TMP" 2>/dev/null
+else
+    curl -s $PROXY --connect-timeout 8 --max-time 90 "$URL" -o "$TMP" 2>/dev/null
+fi
+if [ ! -s "$TMP" ]; then
+    echo "$(date): 列表无更新(条件请求跳过)，零下载" >> "$LOG"
+    exit 0
+fi
+
+# 2. 格式校验 + md5 双保险（内容相同不更新）
+grep -qE '^\+\.' "$TMP" || { echo "$(date): 下载内容格式异常，丢弃" >> "$LOG"; rm -f "$TMP"; exit 1; }
+new_md5=$(md5sum "$TMP" 2>/dev/null | awk '{print $1}')
+old_md5=""; [ -f "$CACHE" ] && old_md5=$(md5sum "$CACHE" 2>/dev/null | awk '{print $1}')
+if [ -n "$old_md5" ] && [ "$new_md5" = "$old_md5" ]; then
+    echo "$(date): 内容与本地一致(md5相同)，不更新" >> "$LOG"; rm -f "$TMP"; exit 0
+fi
+mv "$TMP" "$CACHE"
+echo "$(date): 列表已更新: $(wc -l < "$CACHE" 2>/dev/null) 条 +.域名" >> "$LOG"
+
+# 3. 收集 config 缺失行，一次性插入（+.cn 锚点前；head/tail 拼接，避免逐条重写）
+MISS=/tmp/_geosite.miss; : > "$MISS"; n=0
+while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    pat="    - '$d'"
+    grep -qF "$pat" "$CONFIG" 2>/dev/null || { echo "$pat" >> "$MISS"; n=$((n+1)); }
+done < "$CACHE"
+
+if [ "$n" -gt 0 ]; then
+    cp "$CONFIG" "$CONFIG.bak.geosite.$(date +%s)" 2>/dev/null
+    ln=$(grep -nF "    - '+.cn'" "$CONFIG" 2>/dev/null | head -1 | cut -d: -f1)
+    if [ -n "$ln" ]; then
+        head -n "$ln" "$CONFIG" > "$CONFIG.tmp" 2>/dev/null
+        cat "$MISS" >> "$CONFIG.tmp" 2>/dev/null
+        tail -n +$((ln+1)) "$CONFIG" >> "$CONFIG.tmp" 2>/dev/null
+        mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null
+    fi
+    echo "$(date): 已注入 $n 条新白名单（零重启，重启/订阅更新时生效）" >> "$LOG"
+else
+    echo "$(date): 白名单已全部在 config，无新增（共 $(wc -l < "$CACHE" 2>/dev/null) 条）" >> "$LOG"
+fi
+rm -f "$MISS"
+exit 0

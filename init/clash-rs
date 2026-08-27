@@ -132,6 +132,8 @@ start() {
 
     # 网络优化
     optimize_network
+    # 启动时检查社区白名单更新（geosite 条件下载，没更新不下载；零重启）
+    [ -x /usr/bin/geosite-cn-update ] && /usr/bin/geosite-cn-update >/dev/null 2>&1
     # 应用自动收集的国内域名白名单（fakeip-cn-auto apply 零重启；域名源自 /etc/clash-rs/fakeip-cn.list）
     # 内核启动时应用规则，日常 sync 只收集不重启
     [ -x /usr/bin/fakeip-cn-auto ] && /usr/bin/fakeip-cn-auto apply >/dev/null 2>&1
