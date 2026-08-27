@@ -132,6 +132,9 @@ start() {
 
     # 网络优化
     optimize_network
+    # 应用自动收集的国内域名白名单（fakeip-cn-auto apply 零重启；域名源自 /etc/clash-rs/fakeip-cn.list）
+    # 内核启动时应用规则，日常 sync 只收集不重启
+    [ -x /usr/bin/fakeip-cn-auto ] && /usr/bin/fakeip-cn-auto apply >/dev/null 2>&1
     # reload sysctl params (restore after network override)
     sysctl -p /etc/sysctl.conf >/dev/null 2>&1
 echo -1000 > /proc/$(pidof netifd)/oom_score_adj 2>/dev/null

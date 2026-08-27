@@ -1,91 +1,102 @@
 #!/bin/sh
 # ============================================================
-# fakeip-cn-auto - 智能识别国内域名/CDN，加入 fake-ip-filter 白名单
-# 原理:
-#   1. 对每个候选域名，用国内公共 DNS（绕过 clash 的 fake-ip）解析真实 IP
-#   2. 用 ipset cn_ip 判断 IP 是否大陆
-#   3. 大陆 → 域名加入 fake-ip-filter（DNS 返回真实 IP → iptables cn_ip 直连）
-# 用法: fakeip-cn-auto [domain...]   （不带参数 = 内置列表 + 命令行追加）
-# 日志: /var/log/fakeip-cn-auto.log
-# 安全: 仅当有新增域名时才重启 clash-rs（无新增不重启不断网）
+# fakeip-cn-auto v2 - 国内域名白名单 收集/应用 双模式
+# 用法:
+#   fakeip-cn-auto sync          收集: clash connections 动态源 + 参数域名
+#                                → 写 /etc/clash-rs/fakeip-cn.list（零重启、不改配置）
+#   fakeip-cn-auto apply         应用: list → config.yaml fake-ip-filter（零重启；init.d start 时调用）
+#   fakeip-cn-auto apply-restart 应用 + 重启 clash-rs（手动完整生效）
+#   fakeip-cn-auto 域名...       手动收集指定域名到 list
+# 原理: 国内域名进 fake-ip-filter → DNS 返回真实 IP → iptables cn_ip 直连
+#       （流量完全不经过 clash-rs 进程 = 最快；IP 层 cn_ip 兜底 = 误判最少）
 # ============================================================
 CONFIG=/etc/clash-rs/config.yaml
-LOG=/var/log/fakeip-cn-auto.log
+LIST=/etc/clash-rs/fakeip-cn.list
 LOCK=/tmp/fakeip-cn-auto.lock
+LOG=/var/log/fakeip-cn-auto.log
 DNSS="119.29.29.29 223.5.5.5 114.114.114.114"
+API=http://127.0.0.1:9090
+AUTH="Authorization: Bearer clashrs2026"
 
 # 单实例锁
 [ -f "$LOCK" ] && [ -d "/proc/$(cat $LOCK 2>/dev/null)" ] && exit 0
 echo $$ > "$LOCK"
 trap "rm -f $LOCK" EXIT
 
-# 内置候选：常见国内服务/CDN 域名（与 fake-ip-filter 重叠的会被去重跳过）
-CANDIDATES="zhimg.com weibocdn.com 360buyimg.com biliapi.net baidupcs.com qiyipic.com ykimg.com qy.net ksapisrv.com ele.me cnblogs.com diyidan.com amap.com mapbar.com autonavi.com 91.com csdnimg.cn itc.cn hdslb.com douyinstatic.com yximgs.com bcebos.com gtimg.com qcloudimg.com myqcloud.com 126.net meituan.net qpic.cn bdstatic.com"
+is_ip() { echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
 
-# 已知国内后缀（根域无 A 记录/解析特殊，人工确认国内服务，直接加入不依赖解析）
-KNOWN_CN="$CANDIDATES zhimg.com biliapi.net"
-[ $# -gt 0 ] && KNOWN_CN="$KNOWN_CN $@"
-
-# 候选 = 已知国内后缀（直接尝试） + 其余用解析判断；add_list 最终去重
-CN_LIST="zhimg.com biliapi.net"
-add_list=""
-for d in $KNOWN_CN; do
-    # 已在 config 中则跳过
-    if grep -qF "    - '+.$d'" "$CONFIG" 2>/dev/null; then
-        continue
-    fi
-    add_cn=0
-    # 已知国内后缀直接加入
-    for k in $CN_LIST; do
-        if [ "$d" = "$k" ]; then add_cn=1; break; fi
-    done
-    # 解析真实 IP（多 DNS 容错；busybox nslookup 输出 Address N: 为解析结果）
+# 判断单个域名是否国内，是则追加到 list（幂等：已在 config/list 跳过）
+collect_one() {
+    d="$1"
+    [ -z "$d" ] && return
+    grep -qF "    - '+.$d'" "$CONFIG" 2>/dev/null && return
+    grep -Fxq "$d" "$LIST" 2>/dev/null && return
     ip=""
     for ns in $DNSS; do
         ip=$(nslookup "$d" "$ns" 2>/dev/null | grep -E 'Address [0-9]' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -2 | tr '\n' ' ')
         [ -n "$ip" ] && break
     done
     if [ -z "$ip" ]; then
-        if [ "$add_cn" = "1" ]; then
-            add_list="$add_list $d"
-            echo "$(date): ADD 已知国内 $d (无A记录直加)" >> "$LOG"
-        else
-            echo "$(date): SKIP 解析失败 $d" >> "$LOG"
+        echo "$(date): SKIP 解析失败 $d" >> "$LOG"
+        return
+    fi
+    for ip1 in $ip; do
+        # ipset test 退出码: 0=in cn_ip(大陆)
+        if ipset test cn_ip "$ip1" >/dev/null 2>&1; then
+            echo "$d" >> "$LIST"
+            sort -u "$LIST" -o "$LIST" 2>/dev/null
+            echo "$(date): COLLECT 国内 $d -> $ip" >> "$LOG"
+            return
         fi
-        continue
-    fi
-    # cn_ip 判断（退出码更可靠：ipset 的 "is in set" 提示走 stderr，grep stdout 会误判）
-    cn=$add_cn
-    if [ "$cn" != "1" ]; then
-        for ip1 in $ip; do
-            if ipset test cn_ip "$ip1" >/dev/null 2>&1; then
-                cn=1
-                break
-            fi
+    done
+    echo "$(date): SKIP 非国内 $d -> $ip" >> "$LOG"
+}
+
+sync() {
+    echo "$(date): === sync 开始 ===" >> "$LOG"
+    # 动态源: clash 当前活动连接的域名（自学习用户实际访问的域名）
+    curl -s --max-time 6 "$API/connections" -H "$AUTH" 2>/dev/null \
+        | grep -oE '"host":"[^"]+"' | sed 's/"host":"//; s/"//' \
+        | sort -u | while IFS= read -r d; do
+            is_ip "$d" && continue
+            echo "$d" | grep -qE '\.(arpa|local|lan|i2p)$' && continue
+            collect_one "$d"
         done
-    fi
-    if [ "$cn" = "1" ]; then
-        add_list="$add_list $d"
-        echo "$(date): ADD 国内 $d -> $ip" >> "$LOG"
-    else
-        echo "$(date): SKIP 非国内 $d -> $ip" >> "$LOG"
-    fi
-done
+    # 命令行追加的域名
+    for d in "$@"; do
+        collect_one "$d"
+    done
+    echo "$(date): === sync 完成 ($(wc -l < "$LIST" 2>/dev/null || echo 0) 条 in list) ===" >> "$LOG"
+}
 
-if [ -z "$add_list" ]; then
-    echo "$(date): 无新增，不重启" >> "$LOG"
-    exit 0
-fi
+apply() {
+    [ -s "$LIST" ] || { echo "list 空，无应用"; return 1; }
+    added=""
+    while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        grep -qF "    - '+.$d'" "$CONFIG" 2>/dev/null && continue
+        added="$added $d"
+    done < "$LIST"
+    [ -z "$added" ] && { echo "无新增，不需应用(零重启)"; return 0; }
+    cp "$CONFIG" "$CONFIG.bak.fakeip.$(date +%s)" 2>/dev/null
+    for d in $added; do
+        sed -i "s|^    - '+\.cn'|    - '+.$d'\n    - '+.cn'|" "$CONFIG" 2>/dev/null
+    done
+    echo "$(date): apply 新增 $(echo $added | wc -w) 个: $added" >> "$LOG"
+    echo "已应用 $(echo $added | wc -w) 个域名到 fake-ip-filter (零重启)"
+    return 0
+}
 
-# 备份 + 插入 fake-ip-filter（+.cn 锚点前）
-# add_list 去重
-add_list=$(echo $add_list | tr ' ' '\n' | sort -u | tr '\n' ' ')
-cp "$CONFIG" "$CONFIG.bak.fakeip.$(date +%s)" 2>/dev/null
-for d in $add_list; do
-    sed -i "s|^    - '+\.cn'|    - '+.$d'\n    - '+.cn'|" "$CONFIG" 2>/dev/null
-done
-echo "$(date): 新增 $(echo $add_list | wc -w) 个国内域名: $add_list" >> "$LOG"
-# 重启生效（同步，避免 SSH/cron 后台进程被 SIGHUP 杀导致配置不生效）
-/etc/init.d/clash-rs restart >/dev/null 2>&1
-echo "$(date): 配置已更新，重启完成" >> "$LOG"
+case "$1" in
+    sync)          shift; sync "$@" ;;
+    apply)         apply ;;
+    apply-restart) apply && /etc/init.d/clash-rs restart >/dev/null 2>&1 ;;
+    *)
+        if [ $# -gt 0 ]; then sync "$@"
+        else
+            echo "用法: fakeip-cn-auto [sync|apply|apply-restart|域名...]" >&2
+            exit 1
+        fi
+        ;;
+esac
 exit 0
