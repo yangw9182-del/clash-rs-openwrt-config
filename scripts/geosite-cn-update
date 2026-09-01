@@ -24,9 +24,12 @@ FORCE="$1"
 echo $$ > "$LOCK"
 trap "rm -f $LOCK" EXIT
 
-# 走 clash 代理（常态在跑）；start 时 clash 未起则快速失败，容忍
+# 走 clash 代理（常态在跑）；start 时 clash 未起则快速跳过，避免阻塞 init.d start
 if curl -s --connect-timeout 2 -o /dev/null http://127.0.0.1:7890 2>/dev/null; then
     PROXY="-x http://127.0.0.1:7890"
+else
+    # clash 未起(重启窗口期): 跳过本次下载, 白名单已在config不丢; 避免阻塞启动
+    exit 0
 fi
 
 # 1. 条件下载：-z 用缓存文件时间对比服务器 Last-Modified，未更新则返回空(304)不下载
