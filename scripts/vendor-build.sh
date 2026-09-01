@@ -1,9 +1,12 @@
 #!/bin/sh
 # ============================================================
 # vendor-build.sh - 多供应商 config 生成器
-# 原理: 每个供应商有独立节点文件(vendors/<name>.list), 只有"激活"供应商的
-#       节点才写进 config.yaml → 未激活供应商节点零内存零CPU
-# 白名单/DNS/rules: 从当前 config 保留(geosite社区+自学习实时注入不丢)
+# 面板控制: 生成 VENDOR 组(select, 成员=airport/aladdin 两个子组),
+#   用户在代理面板点选 VENDOR 组切换供应商, vendor-watch 检测后自动重建
+# 冻结: 只有激活供应商的节点写进 config → 未激活供应商零内存零CPU
+#   未激活子组用 DIRECT 占位(内置, 零成本), 保证 VENDOR 组始终可选
+# AUTO: 只包含激活供应商节点(url-test 只测激活节点)
+# 白名单/DNS/rules: 从当前 config 保留(geosite社区+自学习不丢)
 # 用法:
 #   vendor-build.sh <name> [--dry-run]
 #     <name> = airport|aladdin  切换并重建
@@ -15,13 +18,22 @@ CONFIG=/etc/clash-rs/config.yaml
 ACTIVE_FILE=$VENDOR_DIR/active
 MODE="${1:-}"
 DRY="${2:-}"
+INIT="${3:-}"   # init 模式: 重启后由 init.d 调用, 恢复面板 VENDOR 组选中
 
-# 切换供应商(持久)
+# 供应商列表
+VENDORS="airport aladdin"
+
+# 切换供应商(持久, 但先记旧值, 校验通过后才真正落盘)
+OLD_ACTIVE=$(cat "$ACTIVE_FILE" 2>/dev/null || echo airport)
 if [ -n "$MODE" ] && [ "$MODE" != "--dry-run" ]; then
     [ -f "$VENDOR_DIR/$MODE.list" ] || { echo "供应商 $MODE 不存在"; exit 1; }
-    echo "$MODE" > "$ACTIVE_FILE"
 fi
-ACTIVE=$(cat "$ACTIVE_FILE" 2>/dev/null || echo airport)
+# ACTIVE 用目标值(切到新模式)或当前值
+if [ -n "$MODE" ] && [ "$MODE" != "--dry-run" ]; then
+    ACTIVE="$MODE"
+else
+    ACTIVE="$OLD_ACTIVE"
+fi
 LIST=$VENDOR_DIR/$ACTIVE.list
 [ -f "$LIST" ] || { echo "供应商 $ACTIVE 无节点列表 $LIST"; exit 1; }
 
@@ -29,8 +41,14 @@ LIST=$VENDOR_DIR/$ACTIVE.list
 if [ ! -f "$CONFIG" ]; then echo "缺当前 config"; exit 1; fi
 HEADER=$(sed -n '1,/^proxies:/p' "$CONFIG" | sed '$d')
 RULES=$(sed -n '/^rules:/,$p' "$CONFIG")
+# 强制禁用 store-selected: 重启后 VENDOR 组默认=第一个成员=ACTIVE, 从根上消除
+# 面板选择与 active 不一致导致的横跳/直连问题
+HEADER=$(echo "$HEADER" | sed 's/^\(\s*store-selected:\) *true$/\1 false/')
 
-# 生成: header + 激活供应商节点 + proxy-groups + rules
+# 激活供应商的节点名
+NODES=$(grep -oE 'name: "[^"]+"' "$LIST" | sed 's/name: "//; s/"$//')
+
+# 生成: header + 激活供应商节点 + proxy-groups(VENDOR/子组/PROXY/AUTO) + rules
 {
     echo "$HEADER"
     echo ""
@@ -38,13 +56,38 @@ RULES=$(sed -n '/^rules:/,$p' "$CONFIG")
     cat "$LIST"
     echo ""
     echo "proxy-groups:"
+    # ---- VENDOR 供应商选择组(面板控制, 激活的放第一=默认选中) ----
+    echo "  - name: VENDOR"
+    echo "    type: select"
+    echo "    proxies:"
+    echo "      - $ACTIVE"
+    for v in $VENDORS; do
+        [ "$v" = "$ACTIVE" ] && continue
+        echo "      - $v"
+    done
+    echo ""
+    # ---- 各供应商子组: 激活=真实节点, 未激活=DIRECT占位(冻结零内存) ----
+    for v in $VENDORS; do
+        echo "  - name: $v"
+        echo "    type: select"
+        echo "    proxies:"
+        if [ "$v" = "$ACTIVE" ]; then
+            echo "$NODES" | grep -v '^$' | sed 's/^/      - /'
+        else
+            echo "      - DIRECT"
+        fi
+        echo ""
+    done
+    # ---- PROXY 用户日常选择(默认 AUTO 自动策略) ----
     echo "  - name: PROXY"
     echo "    type: select"
     echo "    proxies:"
     echo "      - AUTO"
+    echo "      - VENDOR"
     echo "      - DIRECT"
-    grep -oE 'name: "[^"]+"' "$LIST" | sed 's/name: "/      - "/'
+    echo "$NODES" | grep -v '^$' | sed 's/^/      - /'
     echo ""
+    # ---- AUTO 自动策略(只测激活供应商节点) ----
     echo "  - name: AUTO"
     echo "    type: url-test"
     echo "    url: http://cp.cloudflare.com/generate_204"
@@ -52,7 +95,7 @@ RULES=$(sed -n '/^rules:/,$p' "$CONFIG")
     echo "    tolerance: 100"
     echo "    timeout: 5"
     echo "    proxies:"
-    grep -oE 'name: "[^"]+"' "$LIST" | sed 's/name: "/      - "/'
+    echo "$NODES" | grep -v '^$' | sed 's/^/      - /'
     echo ""
     echo "$RULES"
 } > "$CONFIG.new"
@@ -63,13 +106,39 @@ if ! /etc/clash-rs/clash-rs -t -f "$CONFIG.new" >/dev/null 2>&1; then
     rm -f "$CONFIG.new"
     exit 1
 fi
-NCNT=$(grep -cE 'name: "[^"]+"' "$LIST")
+NCNT=$(echo "$NODES" | grep -c .)
 if [ "$DRY" = "--dry-run" ] || [ "$MODE" = "--dry-run" ]; then
     echo "dry-run OK: $(wc -l < $CONFIG.new)行, $ACTIVE $NCNT 节点"
     exit 0
 fi
 
+# 应用前记录旧激活(供切换日志)
+OLD="$OLD_ACTIVE"
+
+# 无变化则跳过重启(保持 sub-update/init.d 的"内容无变化跳过重启"行为)
+if cmp -s "$CONFIG" "$CONFIG.new" 2>/dev/null; then
+    rm -f "$CONFIG.new"
+    echo "config 无变化, 跳过重启 (供应商: $ACTIVE)"
+    exit 0
+fi
+
+# 校验已通过: 现在才真正落盘 active(切换持久化), 保证校验失败时 active 不残留
+echo "$ACTIVE" > "$ACTIVE_FILE"
 mv "$CONFIG.new" "$CONFIG"
-echo "已切换供应商: $ACTIVE ($NCNT 节点)"
+echo "供应商: $OLD -> $ACTIVE ($NCNT 节点)"
 /etc/init.d/clash-rs restart >/dev/null 2>&1 &
 echo "clash-rs 重启中..."
+# 重启后同步面板 VENDOR 组选择 = 新 active(防 store-selected 横跳)
+# 后台等待 API 就绪后 PUT /proxies/VENDOR, 使面板与 active 一致
+(
+    i=0
+    while [ $i -lt 30 ]; do
+        if curl -s -m 2 -H 'Authorization: Bearer clashrs2026' http://127.0.0.1:9090/proxies/VENDOR >/dev/null 2>&1; then
+            curl -s -m 3 -X PUT -H 'Authorization: Bearer clashrs2026' \
+                -d "{\"name\":\"$ACTIVE\"}" http://127.0.0.1:9090/proxies/VENDOR >/dev/null 2>&1
+            break
+        fi
+        sleep 1; i=$((i+1))
+    done
+) &
+exit 0
