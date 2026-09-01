@@ -5580,6 +5580,53 @@ EOF
     pl "  生效: 零重启; 由那次重启/订阅更新顺带应用; 每次开机 init.d 也会条件检查"
 }
 
+# ============================================================
+# 多供应商管理 (cc vendor) - 机场订阅 + 阿拉丁 独立供应商
+# 原理: 每个供应商独立节点文件 vendors/<name>.list, 切换时只有激活供应商
+#       节点写进 config → 未激活供应商零内存零CPU
+# ============================================================
+_vendor_manager() {
+    local action="${1:-}" vendor="${2:-}"
+    local VD=/etc/clash-rs/vendors
+    case "$action" in
+        list)
+            pl "${C}  供应商列表${N}"
+            for v in airport aladdin; do
+                local cnt=0 act=""
+                [ -f "$VD/$v.list" ] && cnt=$(grep -c '{' "$VD/$v.list" 2>/dev/null || echo 0)
+                [ "$(cat "$VD/active" 2>/dev/null)" = "$v" ] && act="${G}  ← 激活${N}"
+                pl "  ${Y}$v${N}: $cnt 节点$act"
+            done
+            ;;
+        switch)
+            [ -z "$vendor" ] && { pl "${R}  用法: cc vendor switch <airport|aladdin>${N}"; return 1; }
+            /usr/bin/vendor-build.sh "$vendor"
+            ;;
+        status)
+            local act=$(cat "$VD/active" 2>/dev/null || echo airport)
+            pl "  激活供应商: ${G}$act${N}"
+            for v in airport aladdin; do
+                local cnt=0
+                [ -f "$VD/$v.list" ] && cnt=$(grep -c '{' "$VD/$v.list" 2>/dev/null || echo 0)
+                pl "  $v: $cnt 节点"
+            done
+            ;;
+        update)
+            case "$vendor" in
+                airport) _sub_update_all ;;
+                aladdin) pl "${Y}  阿拉丁节点请在电脑端运行 aladdin_fetch.py 后上传到 /etc/clash-rs/vendors/aladdin.list${N}" ;;
+                *) pl "${R}  用法: cc vendor update <airport|aladdin>${N}" ;;
+            esac
+            ;;
+        *)
+            pl "  ${Y}cc vendor list${N}            列出供应商"
+            pl "  ${Y}cc vendor switch <name>${N}   切换供应商(未激活节点零内存/CPU)"
+            pl "  ${Y}cc vendor status${N}          当前状态"
+            pl "  ${Y}cc vendor update <name>${N}   更新某供应商节点"
+            ;;
+    esac
+}
+
 _sub_sync_manager() {
     local action="${1:-}"
     local arg2="${2:-}"
@@ -5818,49 +5865,17 @@ $decoded"
 $new_line"
     done < "$allnodes"
 
-    # 从旧 config 提取 header 和 rules
-    local header=$(sed -n '1,/^proxies:/p' "$CONFIG" | sed '$d')
-    local rules=$(sed -n '/^rules:/,$p' "$CONFIG")
+    # 多供应商: 机场订阅节点保存到 vendors/airport.list
+    mkdir -p /etc/clash-rs/vendors
+    echo "$real_nodes" | grep -v '^$' > /etc/clash-rs/vendors/airport.list
 
-    # 生成新 config
-    {
-        echo "$header"
-        echo ""
-        echo "proxies:"
-        echo "$real_nodes" | grep -v '^$'
-        echo ""
-        echo "proxy-groups:"
-        echo "  - name: PROXY"
-        echo "    type: select"
-        echo "    proxies:"
-        echo "      - AUTO"
-        echo "      - DIRECT"
-        echo "$node_names" | grep -v '^$' | while IFS= read -r n; do
-            echo "      - \"$n\""
-        done
-        echo ""
-        echo "  - name: AUTO"
-        echo "    type: url-test"
-        echo "    url: http://cp.cloudflare.com/generate_204"
-        echo "    interval: 600"
-        echo "    tolerance: 100"
-        echo "    timeout: 5"
-        echo "    proxies:"
-        echo "$node_names" | grep -v '^$' | while IFS= read -r n; do
-            echo "      - \"$n\""
-        done
-        echo ""
-        echo "$rules"
-    } > "$CONFIG.tmp"
-
-    # 先 mv 再 reload（避免 reload 旧 config）
-    if cmp -s "$CONFIG" "$CONFIG.tmp" 2>/dev/null; then
-        rm -f "$CONFIG.tmp"
-        pl "${G}  订阅内容无变化，跳过重启${N}"
+    # 仅当 airport 是激活供应商时重建 config; 否则只更新列表(冻结, 不占内存/CPU)
+    local act=$(cat /etc/clash-rs/vendors/active 2>/dev/null || echo airport)
+    if [ "$act" = "airport" ]; then
+        /usr/bin/vendor-build.sh airport
+        pl "${G}  机场订阅已更新: $total 个节点 (airport 激活, 已重建 config)${N}"
     else
-        mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null
-        pl "${G}  订阅已更新: $total 个节点, 重启 clash-rs 生效${N}"
-        /etc/init.d/clash-rs restart >/dev/null 2>&1 &
+        pl "${Y}  机场订阅已更新到 airport.list ($total 节点); 当前激活 $act, 冻结未加载${N}"
     fi
     rm -f "$allnodes"
 }
@@ -6160,6 +6175,9 @@ case "$1" in
     sub-update) _sub_update_all ;;
     sub-auto) _sub_auto_update "$2" ;;
     sub-sync) _sub_sync_manager "$2" "$3" ;;
+    vendor)
+        _vendor_manager "$2" "$3"
+        ;;
     dns)
         # cc dns 进入DNS子菜单; cc dns-query <domain> 是DNS测试
         if [ -z "$2" ]; then do_dns_conf
