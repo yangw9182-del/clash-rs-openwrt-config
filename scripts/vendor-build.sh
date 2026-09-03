@@ -140,5 +140,24 @@ echo "clash-rs 重启中..."
         fi
         sleep 1; i=$((i+1))
     done
+
+    # === 预热(方案A): 切换后并发预解析激活节点域名 + 触发AUTO测速 ===
+    # 解决"切到 airport 后域名节点要现解析导致窗口期慢"的问题
+    # 节点 server 为域名时, clash 重启后缓存清空, 首次连接/测速要重新解析
+    (
+        # 提取当前 config 里激活供应商节点(proxies段)的所有域名 server(非IP)
+        DNS_SERVERS=$(sed -n '/^proxies:/,/^proxy-groups:/p' "$CONFIG" \
+            | grep -oE 'server: [^,]+' | awk '{print $2}' \
+            | grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+        # 并发后台解析(每个域名单独子进程, 不阻塞; 让 hickory/clash DNS 缓存预热)
+        for _d in $DNS_SERVERS; do
+            ( nslookup "$_d" 127.0.0.1 >/dev/null 2>&1 ) &
+        done
+        wait 2>/dev/null
+        # 触发 AUTO 组测速(让 url-test 立刻选最优, 不等 interval 周期)
+        curl -s -m 30 -H 'Authorization: Bearer clashrs2026' \
+            "http://127.0.0.1:9090/group/AUTO/delay?url=http://cp.cloudflare.com/generate_204&timeout=4000" \
+            >/dev/null 2>&1
+    ) &
 ) &
 exit 0

@@ -5209,11 +5209,17 @@ _sub_download_one() {
         fi
     fi
 
-    curl -s -L --connect-timeout 15 --max-time 30 $proxy_opts $resolve_opts -o "$tmp" "$url" 2>/dev/null
+    # 下载(优先直连真实IP, 失败回退代理): 被墙域名解析出的IP直连不通(000超时), 需代理兜底
+    curl -s -L --connect-timeout 12 --max-time 25 $proxy_opts $resolve_opts -o "$tmp" "$url" 2>/dev/null
+    # 回退代理: 直连失败/为空 且 尚未走代理时, 改用代理重试(订阅服务器多在境外被墙)
+    if [ ! -s "$tmp" ] && [ -z "$proxy_opts" ]; then
+        curl -s -L --connect-timeout 12 --max-time 30 -x http://127.0.0.1:7890 -o "$tmp" "$url" 2>/dev/null
+    fi
     [ ! -s "$tmp" ] && { echo ''; return; }
     local first=$(head -1 "$tmp")
     if echo "$first" | grep -qE 'proxies:|proxy-groups:|mixed-port:'; then
-        sed -n '/^proxies:/,/^proxy-groups:/p' "$tmp" | grep 'name:'
+        # Clash/ClashMeta YAML: 兼容单行flow(- {name:...})与多行块(- name:.. 换行 server:..)
+        _yaml_to_flow "$tmp"
     else
         local decoded='/tmp/sub_dec.txt'
         base64 -d "$tmp" > "$decoded" 2>/dev/null || cp "$tmp" "$decoded"
@@ -5222,11 +5228,50 @@ _sub_download_one() {
                 ss://*) _parse_ss "$line" ;;
                 trojan://*) _parse_trojan "$line" ;;
                 anytls://*) _parse_anytls "$line" ;;
+                vmess://*) _parse_vmess "$line" ;;
+                vless://*) _parse_vless "$line" ;;
+                hysteria2://*|hy2://*) _parse_hysteria2 "$line" ;;
+                tuic://*) _parse_tuic "$line" ;;
             esac
         done < "$decoded"
         rm -f "$decoded"
     fi
     rm -f "$tmp"
+}
+
+# Clash/ClashMeta YAML proxies段 → 单行flow(- {name:.., server:.., ...})
+# 兼容两种机场订阅格式: 单行flow(- {name:..}) 与 多行块(- name:.. 换行 server:..)
+# 输入: 完整config/订阅文件; 输出: 每个节点一行flow
+_yaml_to_flow() {
+    awk '
+        /^proxies:/ {inproxy=1; next}
+        /^proxy-groups:/ {inproxy=0; flush()}
+        inproxy==0 {next}
+        # 单行flow: - {name: ...} 直接输出(去掉前导空白)
+        /^[[:space:]]*-[[:space:]]*\{/ {
+            flush()
+            line=$0; sub(/^[[:space:]]*/,"",line)
+            print line; next
+        }
+        # 多行块节点开始: - name: xxx
+        /^[[:space:]]*-[[:space:]]*[A-Za-z]/ {
+            flush()
+            cur=$0; sub(/^[[:space:]]*-[[:space:]]*/,"",cur); cur=cur
+            has=1; next
+        }
+        # 多行块字段行(缩进的 key: value)
+        /^[[:space:]]+[A-Za-z]/ {
+            if(has) {
+                f=$0; sub(/^[[:space:]]*/,"",f)
+                cur=cur ", " f
+            }
+            next
+        }
+        function flush() {
+            if(has) { print "  - {" cur "}"; has=0; cur="" }
+        }
+        END { flush() }
+    ' "$1"
 }
 
 _parse_ss() {
@@ -5245,6 +5290,11 @@ _parse_ss() {
     echo "  - {name: \"$name\", server: $server, port: $port, type: ss, cipher: $method, password: \"$passwd\", udp: true}"
 }
 
+# 从 URL 查询参数取值: _qparam "sni=xxx&flow=yyy" "sni" -> xxx
+_qparam() {
+    echo "$1" | tr '&' '\n' | grep -E "^$2=" | head -1 | cut -d= -f2- | sed 's/%20/ /g'
+}
+
 _parse_trojan() {
     local line="$1"
     line="${line#trojan://}"
@@ -5254,8 +5304,11 @@ _parse_trojan() {
     local server_port=$(echo "$rest" | sed -n 's/.*@//p' | sed 's/?.*//')
     local server=$(echo "$server_port" | sed -n 's/:\([0-9]*\)$//p')
     local port=$(echo "$server_port" | sed -n 's/.*://p')
+    # SNI 保真: 从订阅 ?sni= 读取, 缺省才用 baidu 占位
+    local qs="${rest#*\?}"; [ "$qs" = "$rest" ] && qs=""
+    local sni=$(_qparam "$qs" "sni"); [ -z "$sni" ] && sni="www.baidu.com"
     [ -z "$name" ] && name="Trojan-$port"
-    echo "  - {name: \"$name\", server: $server, port: $port, type: trojan, password: \"$passwd\", sni: www.baidu.com, skip-cert-verify: true, udp: true}"
+    echo "  - {name: \"$name\", server: $server, port: $port, type: trojan, password: \"$passwd\", sni: $sni, skip-cert-verify: true, udp: true}"
 }
 
 _parse_anytls() {
@@ -5267,8 +5320,102 @@ _parse_anytls() {
     local server_port=$(echo "$rest" | sed -n 's/.*@//p' | sed 's/?.*//')
     local server=$(echo "$server_port" | sed -n 's/:\([0-9]*\)$//p')
     local port=$(echo "$server_port" | sed -n 's/.*://p')
+    # SNI 保真: 从订阅 ?sni= 读取(机场常用各自伪装域名), 缺省才用 baidu 占位
+    local qs="${rest#*\?}"; [ "$qs" = "$rest" ] && qs=""
+    local sni=$(_qparam "$qs" "sni"); [ -z "$sni" ] && sni="www.baidu.com"
     [ -z "$name" ] && name="AnyTLS-$port"
-    echo "  - {name: \"$name\", server: $server, port: $port, type: anytls, password: \"$passwd\", client-fingerprint: chrome, sni: www.baidu.com, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}"
+    echo "  - {name: \"$name\", server: $server, port: $port, type: anytls, password: \"$passwd\", client-fingerprint: chrome, sni: $sni, skip-cert-verify: true, alpn: [h2, http/1.1], udp: true}"
+}
+
+# 从 JSON 取字符串字段(无jq): _jget '{"add":"1.2.3.4"}' "add" -> 1.2.3.4
+_jget() {
+    echo "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p' | head -1
+}
+
+_parse_vmess() {
+    # vmess://base64(json)  标准 vmess 分享格式
+    local line="$1"
+    line="${line#vmess://}"
+    line=$(echo "$line" | tr -d '\r\n ')
+    local json=$(echo -n "$line" | base64 -d 2>/dev/null)
+    [ -z "$json" ] && return
+    local name server port uuid aid net tls sni host path
+    name=$(_jget "$json" ps); server=$(_jget "$json" add); port=$(_jget "$json" port)
+    uuid=$(_jget "$json" id); aid=$(_jget "$json" aid); net=$(_jget "$json" net)
+    tls=$(_jget "$json" tls); sni=$(_jget "$json" sni); host=$(_jget "$json" host); path=$(_jget "$json" path)
+    [ -z "$name" ] && name="VMess-$port"
+    [ -z "$aid" ] && aid="0"
+    [ -z "$net" ] && net="tcp"
+    local opts="name: \"$name\", server: $server, port: $port, type: vmess, uuid: $uuid, alterId: $aid, cipher: auto, udp: true"
+    [ "$tls" = "tls" ] && opts="$opts, tls: true"
+    if [ -n "$sni" ]; then opts="$opts, servername: $sni"; elif [ -n "$host" ] && [ "$tls" = "tls" ]; then opts="$opts, servername: $host"; fi
+    [ "$net" = "ws" ] && opts="$opts, network: ws, ws-opts: {path: ${path:-/}, headers: {Host: $host}}"
+    echo "  - {$opts}"
+}
+
+_parse_vless() {
+    # vless://uuid@server:port?params#name
+    local line="$1"
+    line="${line#vless://}"
+    local name=$(echo "$line" | sed -n 's/.*#//p' | tr -d '\r')
+    local rest="${line%%#*}"
+    local uuid=$(echo "$rest" | sed -n 's/^\([^@]*\)@.*/\1/p')
+    local server_port=$(echo "$rest" | sed -n 's/.*@//p' | sed 's/?.*//')
+    local server=$(echo "$server_port" | sed -n 's/:\([0-9]*\)$//p')
+    local port=$(echo "$server_port" | sed -n 's/.*://p')
+    local qs="${rest#*\?}"; [ "$qs" = "$rest" ] && qs=""
+    local tls=$(_qparam "$qs" "security")
+    local sni=$(_qparam "$qs" "sni")
+    local flow=$(_qparam "$qs" "flow")
+    local net=$(_qparam "$qs" "type")
+    [ -z "$name" ] && name="VLESS-$port"
+    [ -z "$net" ] && net="tcp"
+    local opts="name: \"$name\", server: $server, port: $port, type: vless, uuid: $uuid, udp: true"
+    [ "$tls" = "tls" ] || [ "$tls" = "reality" ] && opts="$opts, tls: true"
+    [ -n "$sni" ] && opts="$opts, servername: $sni"
+    [ -n "$flow" ] && opts="$opts, flow: $flow"
+    [ "$net" = "ws" ] && opts="$opts, network: ws"
+    [ "$net" = "grpc" ] && opts="$opts, network: grpc"
+    opts="$opts, client-fingerprint: chrome"
+    echo "  - {$opts}"
+}
+
+_parse_hysteria2() {
+    # hysteria2://password@server:port?sni=xxx&insecure=1#name  (含 hy2://)
+    local line="$1"
+    line="${line#hysteria2://}"; line="${line#hy2://}"
+    local name=$(echo "$line" | sed -n 's/.*#//p' | tr -d '\r')
+    local rest="${line%%#*}"
+    local passwd=$(echo "$rest" | sed -n 's/^\([^@]*\)@.*/\1/p')
+    local server_port=$(echo "$rest" | sed -n 's/.*@//p' | sed 's/?.*//')
+    local server=$(echo "$server_port" | sed -n 's/:\([0-9]*\)$//p')
+    local port=$(echo "$server_port" | sed -n 's/.*://p')
+    local qs="${rest#*\?}"; [ "$qs" = "$rest" ] && qs=""
+    local sni=$(_qparam "$qs" "sni"); [ -z "$sni" ] && sni="$server"
+    local obfs=$(_qparam "$qs" "obfs")
+    local obfs_pw=$(_qparam "$qs" "obfs-password")
+    [ -z "$name" ] && name="Hysteria2-$port"
+    local opts="name: \"$name\", server: $server, port: $port, type: hysteria2, password: \"$passwd\", sni: $sni, skip-cert-verify: true"
+    [ -n "$obfs" ] && opts="$opts, obfs: $obfs, obfs-password: \"$obfs_pw\""
+    echo "  - {$opts}"
+}
+
+_parse_tuic() {
+    # tuic://uuid:password@server:port?sni=xxx&congestion_control=bbr#name
+    local line="$1"
+    line="${line#tuic://}"
+    local name=$(echo "$line" | sed -n 's/.*#//p' | tr -d '\r')
+    local rest="${line%%#*}"
+    local uuid=$(echo "$rest" | sed -n 's/^\([^:]*\):.*/\1/p')
+    local passwd=$(echo "$rest" | sed -n 's/^[^:]*:\([^@]*\)@.*/\1/p')
+    local server_port=$(echo "$rest" | sed -n 's/.*@//p' | sed 's/?.*//')
+    local server=$(echo "$server_port" | sed -n 's/:\([0-9]*\)$//p')
+    local port=$(echo "$server_port" | sed -n 's/.*://p')
+    local qs="${rest#*\?}"; [ "$qs" = "$rest" ] && qs=""
+    local sni=$(_qparam "$qs" "sni"); [ -z "$sni" ] && sni="$server"
+    local cc=$(_qparam "$qs" "congestion_control"); [ -z "$cc" ] && cc="bbr"
+    [ -z "$name" ] && name="TUIC-$port"
+    echo "  - {name: \"$name\", server: $server, port: $port, type: tuic, uuid: $uuid, password: \"$passwd\", sni: $sni, congestion-controller: $cc, skip-cert-verify: true, udp: true}"
 }
 
 _sub_single_input() {
@@ -5285,6 +5432,10 @@ _sub_single() {
         ss://*) line=$(_parse_ss "$url") ;;
         trojan://*) line=$(_parse_trojan "$url") ;;
         anytls://*) line=$(_parse_anytls "$url") ;;
+        vmess://*) line=$(_parse_vmess "$url") ;;
+        vless://*) line=$(_parse_vless "$url") ;;
+        hysteria2://*|hy2://*) line=$(_parse_hysteria2 "$url") ;;
+        tuic://*) line=$(_parse_tuic "$url") ;;
         *) pl "${R}  不支持${N}"; return ;;
     esac
     [ -z "$line" ] && { pl "${R}  解析失败${N}"; return; }

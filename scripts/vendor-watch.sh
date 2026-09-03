@@ -18,7 +18,11 @@ flock -n 9 || exit 0
 NOW=$(curl -s -m 3 -H 'Authorization: Bearer clashrs2026' \
     'http://127.0.0.1:9090/proxies/VENDOR' 2>/dev/null \
     | sed -n 's/.*"now":"\([^"]*\)".*/\1/p' | head -1)
-[ -z "$NOW" ] && exit 0
+# 加固: 抓不到now(多为clash重启窗口API未就绪)记日志, 便于排查切换丢失; 不静默退出
+if [ -z "$NOW" ]; then
+    echo "$(date '+%F %T') WARN: 抓不到面板now(clash重启中/API未就绪), 本次跳过" >> "$LOG"
+    exit 0
+fi
 
 ACTIVE=$(cat "$ACTIVE_FILE" 2>/dev/null || echo airport)
 
@@ -27,6 +31,9 @@ if [ "$NOW" != "$ACTIVE" ]; then
     # 校验该供应商存在
     [ -f "$VENDOR_DIR/$NOW.list" ] || exit 0
     echo "$(date '+%F %T') 面板切换: $ACTIVE -> $NOW" >> "$LOG"
+    # 修复fd泄漏死锁: 切换前关闭fd9(释放锁+防止cc→vendor-build→init.d→clash子进程继承锁fd)
+    # 否则clash进程持有锁fd → flock永远被占 → vendor-watch永远拿不到锁 → 切换失灵
+    exec 9>&-
     cc vendor switch "$NOW" >> "$LOG" 2>&1
 fi
 exit 0
